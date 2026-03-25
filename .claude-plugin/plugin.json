@@ -1,0 +1,30 @@
+{
+  "name": "dynamics365-dataverse",
+  "description": "Full-stack Dynamics 365 / Dataverse plugin for Claude — 67 MCP tools + 18 skills for metadata exploration, CRUD, plugin management, solution ALM, security auditing, web resources, and more.",
+  "version": "5.0.0",
+  "author": {
+    "name": "Dataverse MCP Server"
+  },
+  "license": "MIT",
+  "mcpServers": ["mcp-server"],
+  "skills": [
+    "skills/query-records",
+    "skills/create-record",
+    "skills/summarize-entity",
+    "skills/explore-metadata",
+    "skills/d365-research",
+    "skills/security-audit",
+    "skills/debug-plugin",
+    "skills/inspect-solutions",
+    "skills/manage-plugins",
+    "skills/manage-webhooks",
+    "skills/manage-webresources",
+    "skills/alm-operations",
+    "skills/audit-history",
+    "skills/managed-identity",
+    "skills/pac-auth",
+    "skills/pac-pcf",
+    "skills/pac-plugin",
+    "skills/pac-solutions"
+  ]
+}

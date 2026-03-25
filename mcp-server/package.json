@@ -1,0 +1,31 @@
+{
+  "name": "dynamics365-mcp-server",
+  "version": "5.0.0",
+  "description": "MCP server for Dynamics 365 / Dataverse — 67 tools for metadata, CRUD, plugins, solutions, security, ALM, and more.",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@azure/identity": "^4.6.0",
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3",
+    "@types/node": "^22.13.4"
+  },
+  "keywords": [
+    "dynamics365",
+    "dataverse",
+    "mcp",
+    "claude",
+    "power-platform",
+    "crm"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
