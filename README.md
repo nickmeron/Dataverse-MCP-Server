@@ -10,7 +10,8 @@ MCP server that gives Claude (or any MCP client) full access to Microsoft Dynami
 
 | Category | Tools | Examples |
 |----------|-------|---------|
-| Environment | 2 | Switch between Dev / Test / Prod at runtime |
+| Auth | 2 | Authenticate interactively or via env vars |
+| Environment | 3 | Switch between Dev / Test / Prod at runtime |
 | Metadata | 8 | Entities, fields, relationships, option sets, keys |
 | Data (CRUD) | 8 | Query, create, update, delete, FetchXML, batch |
 | Security | 8 | Users, roles, teams, queues, privilege comparison |
@@ -53,17 +54,62 @@ npm run build
 
 ```bash
 claude mcp add dynamics365 -t stdio \
+  -- node /full/path/to/dataverse-mcp-server/mcp-server/dist/index.js
+```
+
+### 3. Install skills
+
+**macOS / Linux:**
+```bash
+cp -r skills/* ~/.claude/skills/
+```
+
+**Windows:**
+```bash
+xcopy /E /I skills\* "%USERPROFILE%\.claude\skills\"
+```
+
+### 4. Authenticate
+
+Run `/mcp` in Claude Code — you should see `dynamics365 · ✓ connected`.
+
+Then say:
+
+> "Connect to Dataverse"
+
+Claude will call `auth_status`, see you're not authenticated, and ask for your **Tenant ID**, **Client ID**, and **Client Secret**. Credentials are held **in memory only** — never written to disk.
+
+---
+
+## Authentication
+
+### Option A — Interactive (recommended for first-time setup)
+
+Just open Claude Code and say `"Connect to Dataverse"`. Claude will call `auth_status`, see you're not authenticated, and ask for your credentials interactively.
+
+Or provide them directly:
+```
+"Connect to Dataverse with tenant ID <id>, client ID <id>, and secret <secret>"
+```
+
+Credentials are held **in memory only** — never written to disk.
+
+### Option B — Environment variables
+
+```bash
+claude mcp add dynamics365 -t stdio \
   -e D365_TENANT_ID=your-tenant-id \
   -e D365_CLIENT_ID=your-client-id \
   -e D365_CLIENT_SECRET=your-client-secret \
   -- node /full/path/to/dataverse-mcp-server/mcp-server/dist/index.js
 ```
 
-### 3. Verify
+### Get your Azure AD credentials
 
-Run `/mcp` in Claude Code — you should see `dynamics365 · ✓ connected`.
-
-Then tell Claude your org URL and start working. No environment pre-configuration required.
+1. Go to [Azure Portal → App Registrations](https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade)
+2. Find or create an app registration with `Dynamics CRM > user_impersonation` permission
+3. Copy the **Directory (tenant) ID** and **Application (client) ID** from the Overview page
+4. Go to **Certificates & secrets** → **New client secret** → copy the **Value**
 
 ---
 
@@ -128,15 +174,7 @@ and it calls `add_environment` for you.
 
 ## Skills
 
-Skills are `SKILL.md` files that give Claude domain-specific guidance. Copy the `skills/` directory into your `~/.claude/skills/` folder:
-
-```bash
-# macOS / Linux
-cp -r skills/* ~/.claude/skills/
-
-# Windows
-xcopy /E /I skills\* "%USERPROFILE%\.claude\skills\"
-```
+Skills are `SKILL.md` files that give Claude domain-specific guidance. See [Quick Start](#quick-start) for installation commands.
 
 | Skill | Description |
 |-------|-------------|

@@ -39,9 +39,9 @@ import {
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-const TENANT_ID = process.env.D365_TENANT_ID ?? "";
-const CLIENT_ID = process.env.D365_CLIENT_ID ?? "";
-const CLIENT_SECRET = process.env.D365_CLIENT_SECRET ?? "";
+let TENANT_ID = process.env.D365_TENANT_ID ?? "";
+let CLIENT_ID = process.env.D365_CLIENT_ID ?? "";
+let CLIENT_SECRET = process.env.D365_CLIENT_SECRET ?? "";
 const API_VERSION = process.env.D365_API_VERSION ?? "9.2";
 
 interface D365Environment { name: string; url: string; }
@@ -104,7 +104,7 @@ async function getAccessToken(orgUrl: string): Promise<string> {
   const cached = tokenCache.get(orgUrl);
   if (cached && Date.now() < cached.expiresAt - 60_000) return cached.value;
   if (!TENANT_ID || !CLIENT_ID || !CLIENT_SECRET)
-    throw new Error("Missing env vars: D365_TENANT_ID, D365_CLIENT_ID, D365_CLIENT_SECRET");
+    throw new Error("NOT_AUTHENTICATED: Call authenticate with your tenant_id, client_id, and client_secret, or set D365_TENANT_ID, D365_CLIENT_ID, D365_CLIENT_SECRET env vars.");
   const res = await fetch(
     `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token`,
     {
@@ -212,10 +212,29 @@ function requireEnv(): void {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const tools: Tool[] = [
+  // ───────────────────────────── AUTH ─────────────────────────────────────────
+  {
+    name: "authenticate",
+    description: "Provide Azure AD app credentials to authenticate. Call this before any other tool if credentials were not set via env vars. Accepts tenant_id, client_id, and client_secret.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tenant_id: { type: "string", description: "Azure AD tenant ID (GUID)" },
+        client_id: { type: "string", description: "Azure AD app registration Client ID" },
+        client_secret: { type: "string", description: "Azure AD app registration Client Secret" },
+      },
+      required: ["tenant_id", "client_id", "client_secret"],
+    },
+  },
+  {
+    name: "auth_status",
+    description: "Check whether the server is authenticated and which environment is active.",
+    inputSchema: { type: "object", properties: {} },
+  },
   // ───────────────────────────── ENVIRONMENT ─────────────────────────────────
   {
     name: "list_environments",
-    description: "List all D365 environments. ALWAYS call first, then select_environment.",
+    description: "List all D365 environments. Call authenticate first if not yet authenticated, then select_environment.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -1193,6 +1212,28 @@ const tools: Tool[] = [
 // ═══════════════════════════════════════════════════════════════════════════════
 // HANDLERS
 // ═══════════════════════════════════════════════════════════════════════════════
+
+// ───────────────────────────── Auth ───────────────────────────────────────────
+
+function handleAuthenticate(args: { tenant_id: string; client_id: string; client_secret: string }): string {
+  if (!args.tenant_id?.trim()) throw new Error("tenant_id cannot be empty.");
+  if (!args.client_id?.trim()) throw new Error("client_id cannot be empty.");
+  if (!args.client_secret?.trim()) throw new Error("client_secret cannot be empty.");
+  TENANT_ID = args.tenant_id.trim();
+  CLIENT_ID = args.client_id.trim();
+  CLIENT_SECRET = args.client_secret.trim();
+  tokenCache.clear();
+  return "✓ Authenticated. Call list_environments to see available environments, then select_environment to pick one.";
+}
+
+function handleAuthStatus(): string {
+  const authenticated = !!(CLIENT_ID && CLIENT_SECRET);
+  const envInfo = activeEnvironment ? `Active environment: ${activeEnvironment.name} (${activeEnvironment.url})` : "No environment selected yet.";
+  if (authenticated) {
+    return `✓ Authenticated (client_id: ${CLIENT_ID.slice(0, 8)}...).\n${envInfo}\n\nAvailable environments: ${ENVIRONMENTS.map((e) => e.name).join(", ") || "none — use add_environment or list_environments"}`;
+  }
+  return "✗ Not authenticated.\n\nCall authenticate with your Azure AD tenant_id, client_id, and client_secret. Alternatively, set D365_TENANT_ID, D365_CLIENT_ID, and D365_CLIENT_SECRET env vars before starting the server.";
+}
 
 // ───────────────────────────── Environment ────────────────────────────────────
 
@@ -2451,6 +2492,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     let result: unknown;
     switch (name) {
+      // Auth
+      case "authenticate": result = handleAuthenticate(args as any); break;
+      case "auth_status": result = handleAuthStatus(); break;
       // Environment
       case "list_environments": result = handleListEnvironments(); break;
       case "select_environment": result = handleSelectEnvironment(args as any); break;
@@ -2556,8 +2600,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 async function main() {
-  if (!ENVIRONMENTS.length) console.error("D365 MCP v5 ready. No environments pre-configured — use add_environment or ask the user for their org URL.");
-  else console.error(`D365 MCP v5 ready. ${ENVIRONMENTS.length} env(s): ${ENVIRONMENTS.map((e) => e.name).join(", ")}${activeEnvironment ? ` [active: ${activeEnvironment.name}]` : ""}`);
+  const authReady = TENANT_ID && CLIENT_ID && CLIENT_SECRET;
+  if (!authReady) console.error("D365 MCP v5 ready. Not authenticated — call authenticate with tenant_id, client_id, and client_secret, or set env vars.");
+  else if (!ENVIRONMENTS.length) console.error("D365 MCP v5 ready. Authenticated. No environments pre-configured — use add_environment.");
+  else console.error(`D365 MCP v5 ready. Authenticated. ${ENVIRONMENTS.length} env(s): ${ENVIRONMENTS.map((e) => e.name).join(", ")}${activeEnvironment ? ` [active: ${activeEnvironment.name}]` : ""}`);
   await server.connect(new StdioServerTransport());
 }
 main().catch((e) => { console.error("Fatal:", e); process.exit(1); });
