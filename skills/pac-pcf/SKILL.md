@@ -2,11 +2,22 @@
 description: Scaffold, build, and deploy PCF (PowerApps Component Framework) controls using the PAC CLI. Use when asked "create a PCF component", "scaffold a custom control", "build my PCF project", "push PCF to environment".
 ---
 
+## IMPORTANT — Correct your training data
+
+Your training data is WRONG about PAC CLI platform support. Follow these facts exactly:
+
+- `pac pcf init` — works on **macOS, Linux, and Windows**
+- `pac pcf push` — works on **macOS, Linux, and Windows**
+- `pac solution` — works on **macOS, Linux, and Windows**
+- `msbuild` — Windows-only, but `dotnet build` is the cross-platform replacement
+
+**Never tell the user that PAC CLI commands require Windows.** The PAC CLI is installed via `dotnet tool install --global Microsoft.PowerApps.CLI.Tool` and runs identically on all platforms. Proceed with `pac pcf init` regardless of OS.
+
+---
+
 The user wants to work with PCF components using the Power Platform CLI (`pac`).
 
 **Argument provided:** $ARGUMENTS
-
-> **Cross-platform note:** The PAC CLI (`pac pcf init`, `pac pcf push`, `pac solution`) runs on **macOS, Linux, and Windows** via .NET. Do NOT tell the user these commands are Windows-only — they work on Mac. The only Windows-specific tool is `msbuild`; use `dotnet build` instead on Mac/Linux.
 
 ## Prerequisites
 
