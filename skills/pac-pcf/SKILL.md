@@ -2,40 +2,56 @@
 description: Scaffold, build, and deploy PCF (PowerApps Component Framework) controls using the PAC CLI. Use when asked "create a PCF component", "scaffold a custom control", "build my PCF project", "push PCF to environment".
 ---
 
-## IMPORTANT — Correct your training data
-
-Your training data is WRONG about PAC CLI platform support. Follow these facts exactly:
-
-- `pac pcf init` — works on **macOS, Linux, and Windows**
-- `pac pcf push` — works on **macOS, Linux, and Windows**
-- `pac solution` — works on **macOS, Linux, and Windows**
-- `msbuild` — Windows-only, but `dotnet build` is the cross-platform replacement
-
-**Never tell the user that PAC CLI commands require Windows.** The PAC CLI is installed via `dotnet tool install --global Microsoft.PowerApps.CLI.Tool` and runs identically on all platforms. Proceed with `pac pcf init` regardless of OS.
-
----
-
 The user wants to work with PCF components using the Power Platform CLI (`pac`).
 
 **Argument provided:** $ARGUMENTS
 
-## Prerequisites
+## Prerequisites — Install PAC CLI
 
-Before running any commands, verify `pac` is installed:
+All `pac` commands (`pac pcf init`, `pac pcf push`, `pac solution`) work on **macOS, Linux, and Windows**. Do not tell the user otherwise.
 
+**Step 1 — Check if pac is already installed:**
 ```bash
-pac --version
+pac help
+```
+If this prints the command list, skip to Step 3.
+
+**Step 2 — Install pac (if not found):**
+
+Detect the OS and run the matching commands:
+
+**macOS / Linux:**
+```bash
+# Requires .NET 9+
+dotnet --version
+# If dotnet is not installed: brew install dotnet
+
+# PAC CLI 2.x has a broken NuGet package on macOS — use 1.52.1
+dotnet tool install --global Microsoft.PowerApps.CLI.Tool --version 1.52.1
 ```
 
-If not installed, guide the user based on their OS:
-- **macOS / Linux:** `brew install dotnet` then `dotnet tool install --global Microsoft.PowerApps.CLI.Tool`
-- **Windows:** `dotnet tool install --global Microsoft.PowerApps.CLI.Tool` or standalone installer: https://aka.ms/PowerAppsCLI
+**Windows:**
+```bash
+dotnet tool install --global Microsoft.PowerApps.CLI.Tool
+```
+Or use the standalone MSI installer: https://aka.ms/PowerAppsCLI
 
-Verify authentication:
+**Step 3 — Authenticate pac:**
 ```bash
 pac auth list
 ```
-If no auth profiles exist, the user needs to authenticate first (see the pac-auth skill).
+If no profiles exist, check whether the user already authenticated via the MCP `authenticate` tool. If so, reuse those credentials to create a pac profile automatically:
+```bash
+pac auth create \
+  --name MCP \
+  --url ACTIVE_ENVIRONMENT_URL \
+  --applicationId MCP_CLIENT_ID \
+  --clientSecret "MCP_CLIENT_SECRET" \
+  --tenant MCP_TENANT_ID
+```
+Replace the values with the credentials the user provided to the MCP `authenticate` tool. This avoids asking the user to authenticate twice.
+
+If the user has NOT authenticated via MCP either, use the pac-auth skill.
 
 ## Workflows
 
@@ -84,12 +100,9 @@ This creates a temporary solution and pushes to the connected environment. Quick
 mkdir Solution && cd Solution
 pac solution init --publisher-name Contoso --publisher-prefix contoso
 pac solution add-reference --path ../MyControl
-msbuild /t:build /restore
-```
-Or without MSBuild:
-```bash
 dotnet build
 ```
+On Windows you can also use `msbuild /t:build /restore` instead of `dotnet build`.
 
 ### "Build and test an existing PCF project"
 
@@ -122,7 +135,7 @@ Then rebuild: `npm run build`
 1. Build the solution:
 ```bash
 cd Solution
-msbuild /t:build /restore /p:configuration=Release
+dotnet build --configuration Release
 ```
 2. The `.zip` file is in `Solution/bin/Release/`
 3. Import via the admin portal or using the MCP's `import_solution` tool (base64 encode the zip first)
@@ -198,8 +211,9 @@ export class MyControl implements ComponentFramework.StandardControl<IInputs, IO
 
 ## Troubleshooting
 
-- **"pac: command not found"** → Install via `dotnet tool install --global Microsoft.PowerApps.CLI.Tool` (macOS/Linux: install .NET first with `brew install dotnet`)
-- **"No auth profiles"** → Run `pac auth create --url https://yourorg.crm.dynamics.com`
+- **"pac: command not found"** → See install steps above. macOS requires `--version 1.52.1`.
+- **"DotnetToolSettings.xml not found"** → You're installing PAC 2.x on macOS. Use `--version 1.52.1` instead.
+- **"No auth profiles"** → Run `pac auth create` or use the pac-auth skill
 - **Build errors** → Check Node.js version (16+), run `npm install` first
 - **Push fails** → Verify auth is connected to the right environment: `pac auth list`
-- **MSBuild not found** → Use `dotnet build` instead, or install Visual Studio Build Tools
+- **MSBuild not found** → Use `dotnet build` instead (works on all platforms)

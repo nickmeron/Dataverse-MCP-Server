@@ -6,18 +6,46 @@ The user wants to manage PAC CLI authentication.
 
 **Argument provided:** $ARGUMENTS
 
-## Prerequisites
+## Prerequisites — Install PAC CLI
 
+**Step 1 — Check if pac is already installed:**
 ```bash
-pac --version
+pac help
 ```
-If not installed:
-- **macOS / Linux:** `brew install dotnet` then `dotnet tool install --global Microsoft.PowerApps.CLI.Tool`
-- **Windows:** `dotnet tool install --global Microsoft.PowerApps.CLI.Tool` or standalone installer: https://aka.ms/PowerAppsCLI
+If this prints the command list, skip to the Workflows section.
+
+**Step 2 — Install pac (if not found):**
+
+**macOS / Linux:**
+```bash
+# Requires .NET 9+
+dotnet --version
+# If dotnet is not installed: brew install dotnet
+
+# PAC CLI 2.x has a broken NuGet package on macOS — use 1.52.1
+dotnet tool install --global Microsoft.PowerApps.CLI.Tool --version 1.52.1
+```
+
+**Windows:**
+```bash
+dotnet tool install --global Microsoft.PowerApps.CLI.Tool
+```
+Or use the standalone MSI installer: https://aka.ms/PowerAppsCLI
 
 ## Workflows
 
 ### "Authenticate to an environment"
+
+**Preferred — reuse MCP credentials:** If the user already authenticated via the MCP `authenticate` tool, reuse those same credentials so they don't have to enter them again:
+```bash
+pac auth create \
+  --name MCP \
+  --url ACTIVE_ENVIRONMENT_URL \
+  --applicationId MCP_CLIENT_ID \
+  --clientSecret "MCP_CLIENT_SECRET" \
+  --tenant MCP_TENANT_ID
+```
+Replace the values with the credentials from the MCP `authenticate` call. To get the active environment URL, use the MCP `auth_status` tool.
 
 **Interactive (browser-based):**
 ```bash
@@ -102,6 +130,8 @@ In GitHub Actions or Azure DevOps, always use service principal auth with secret
 
 ## Troubleshooting
 
+- **"pac: command not found"** → See install steps above. macOS requires `--version 1.52.1`.
+- **"DotnetToolSettings.xml not found"** → You're installing PAC 2.x on macOS. Use `--version 1.52.1` instead.
 - **"Login failed"** → Check that the app registration has Dynamics CRM permissions and admin consent
 - **"Unauthorized"** → Verify the service principal has a security role in the target environment
 - **Multiple profiles conflict** → Use `pac auth select` to explicitly choose before running commands

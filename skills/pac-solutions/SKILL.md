@@ -8,11 +8,42 @@ The user wants to work with solutions using the Power Platform CLI (`pac`).
 
 ## Prerequisites
 
-Verify `pac` is installed and authenticated:
+**Step 1 — Verify pac is installed:**
 ```bash
-pac --version
+pac help
+```
+If not installed, follow the install steps for the user's OS:
+
+**macOS / Linux:**
+```bash
+# Requires .NET 9+
+dotnet --version
+# If dotnet is not installed: brew install dotnet
+
+# PAC CLI 2.x has a broken NuGet package on macOS — use 1.52.1
+dotnet tool install --global Microsoft.PowerApps.CLI.Tool --version 1.52.1
+```
+
+**Windows:**
+```bash
+dotnet tool install --global Microsoft.PowerApps.CLI.Tool
+```
+Or use the standalone MSI installer: https://aka.ms/PowerAppsCLI
+
+**Step 2 — Verify authentication:**
+```bash
 pac auth list
 ```
+If no profiles exist, check whether the user already authenticated via the MCP `authenticate` tool. If so, reuse those credentials:
+```bash
+pac auth create \
+  --name MCP \
+  --url ACTIVE_ENVIRONMENT_URL \
+  --applicationId MCP_CLIENT_ID \
+  --clientSecret "MCP_CLIENT_SECRET" \
+  --tenant MCP_TENANT_ID
+```
+If the user has NOT authenticated via MCP either, use the pac-auth skill.
 
 ## Workflows
 
@@ -185,6 +216,11 @@ Use with: `pac solution unpack --map map.xml ...`
 For Azure DevOps / GitHub Actions:
 ```yaml
 # GitHub Actions example
+- name: Install .NET
+  uses: actions/setup-dotnet@v4
+  with:
+    dotnet-version: '9.0.x'
+
 - name: Install PAC
   run: dotnet tool install --global Microsoft.PowerApps.CLI.Tool
 
@@ -205,6 +241,8 @@ For Azure DevOps / GitHub Actions:
 
 ## Troubleshooting
 
+- **"pac: command not found"** → See install steps above. macOS requires `--version 1.52.1`.
+- **"DotnetToolSettings.xml not found"** → You're installing PAC 2.x on macOS. Use `--version 1.52.1` instead.
 - **"Solution not found"** → Check the unique name (not display name): `pac solution list`
 - **Unpack fails on large solutions** → Increase timeout: `pac solution unpack --processCanvasApps`
 - **Pack produces empty zip** → Verify folder structure matches expected layout
