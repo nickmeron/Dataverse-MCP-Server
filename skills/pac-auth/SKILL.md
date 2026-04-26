@@ -10,9 +10,9 @@ The user wants to manage PAC CLI authentication.
 
 **Step 1 — Check if pac is already installed:**
 ```bash
-pac help
+pac help || ~/.dotnet/tools/pac help
 ```
-If this prints the command list, skip to the Workflows section.
+If either prints the command list, skip to the Workflows section. If only the second worked, pac is installed but `~/.dotnet/tools` is missing from PATH — add `export PATH="$HOME/.dotnet/tools:$PATH"` to `~/.zshrc` (or `~/.bashrc`) so future sessions resolve `pac` directly.
 
 **Step 2 — Install pac (if not found):**
 
@@ -130,7 +130,7 @@ In GitHub Actions or Azure DevOps, always use service principal auth with secret
 
 ## Troubleshooting
 
-- **"pac: command not found"** → See install steps above. macOS requires `--version 1.52.1`.
+- **"pac: command not found"** → First try `~/.dotnet/tools/pac help`. If that works, pac is installed but `~/.dotnet/tools` is missing from PATH — add `export PATH="$HOME/.dotnet/tools:$PATH"` to `~/.zshrc` (or `~/.bashrc`). Otherwise see install steps; macOS requires `--version 1.52.1`.
 - **"DotnetToolSettings.xml not found"** → You're installing PAC 2.x on macOS. Use `--version 1.52.1` instead.
 - **"Login failed"** → Check that the app registration has Dynamics CRM permissions and admin consent
 - **"Unauthorized"** → Verify the service principal has a security role in the target environment
