@@ -428,6 +428,81 @@ const tools: Tool[] = [
     },
   },
 
+  // ──────────────────────── BULK DELETE OPERATIONS ──────────────────────────
+  {
+    name: "create_bulk_delete_job",
+    description: "Create a bulk deletion job to asynchronously delete records matching a query. Returns a JobId (asyncoperationid) that can be monitored with get_bulk_delete_job.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        job_name: { type: "string", description: "Display name for the bulk delete job" },
+        entity: { type: "string", description: "Entity logical name to delete from (e.g. 'knowledgearticle', 'task')" },
+        filter_conditions: {
+          type: "array",
+          description: "Optional QueryExpression conditions. If omitted, ALL records of the entity are targeted.",
+          items: {
+            type: "object",
+            properties: {
+              attribute: { type: "string", description: "Attribute logical name (e.g. 'statuscode')" },
+              operator: { type: "string", description: "Condition operator: Equal, NotEqual, NotNull, Null, Like, In, GreaterThan, LessThan, OlderThanXDays, etc." },
+              values: { type: "array", items: { type: "string" }, description: "Values for the condition (omit for Null/NotNull)" },
+            },
+            required: ["attribute", "operator"],
+          },
+        },
+        start_datetime: { type: "string", description: "ISO 8601 start time (default: now)" },
+        recurrence_pattern: { type: "string", description: "Recurrence rule string (empty for one-time run)" },
+        send_email_notification: { type: "boolean", description: "Send email on completion (default false)" },
+      },
+      required: ["job_name", "entity"],
+    },
+  },
+  {
+    name: "list_bulk_delete_jobs",
+    description: "List bulk deletion jobs. Filter by status to monitor running or completed jobs.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        status: { type: "string", description: "Filter by status: waiting, running, completed, failed, cancelled. Omit for all." },
+        top: { type: "number", description: "Max results (default 20)" },
+      },
+    },
+  },
+  {
+    name: "get_bulk_delete_job",
+    description: "Get the status and progress of a specific bulk deletion job by its JobId (asyncoperationid).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        job_id: { type: "string", description: "The asyncoperationid (JobId) returned by create_bulk_delete_job" },
+      },
+      required: ["job_id"],
+    },
+  },
+  {
+    name: "cancel_bulk_delete_job",
+    description: "Cancel a bulk deletion job that is waiting or running. This deletes the async operation record.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        job_id: { type: "string", description: "The asyncoperationid (JobId) to cancel" },
+      },
+      required: ["job_id"],
+    },
+  },
+  {
+    name: "get_bulk_delete_failures",
+    description: "Get the list of records that failed to be deleted in a bulk delete job.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        job_id: { type: "string", description: "The asyncoperationid (JobId)" },
+        top: { type: "number", description: "Max failure records to return (default 50)" },
+      },
+      required: ["job_id"],
+    },
+  },
+
   // ───────────────────────────── SECURITY & USERS ────────────────────────────
   {
     name: "get_current_user",
@@ -1420,6 +1495,83 @@ async function handleAssociateRecords(args: { entity: string; id: string; relati
   requireEnv();
   return d365(`${args.entity}(${args.id})/${args.relationship}/$ref`, "POST",
     { "@odata.id": `${getBaseUrl()}/${args.related_entity}(${args.related_id})` });
+}
+
+// ──────────────────────── Bulk Delete Operations ──────────────────────────
+
+async function handleCreateBulkDeleteJob(args: {
+  job_name: string;
+  entity: string;
+  filter_conditions?: Array<{ attribute: string; operator: string; values?: string[] }>;
+  start_datetime?: string;
+  recurrence_pattern?: string;
+  send_email_notification?: boolean;
+}) {
+  requireEnv();
+  const query: Record<string, unknown> = {
+    "@odata.type": "Microsoft.Dynamics.CRM.QueryExpression",
+    EntityName: args.entity,
+    ColumnSet: { "@odata.type": "Microsoft.Dynamics.CRM.ColumnSet", AllColumns: false, Columns: [`${args.entity}id`] },
+    Distinct: false,
+    NoLock: false,
+  };
+  if (args.filter_conditions && args.filter_conditions.length > 0) {
+    query.Criteria = {
+      "@odata.type": "Microsoft.Dynamics.CRM.FilterExpression",
+      FilterOperator: "And",
+      Conditions: args.filter_conditions.map((c) => ({
+        "@odata.type": "Microsoft.Dynamics.CRM.ConditionExpression",
+        AttributeName: c.attribute,
+        Operator: c.operator,
+        Values: c.values ?? [],
+      })),
+    };
+  }
+  return d365("BulkDelete", "POST", {
+    QuerySet: [query],
+    JobName: args.job_name,
+    SendEmailNotification: args.send_email_notification ?? false,
+    ToRecipients: [],
+    CCRecipients: [],
+    RecurrencePattern: args.recurrence_pattern ?? "",
+    StartDateTime: args.start_datetime ?? new Date().toISOString(),
+  });
+}
+
+async function handleListBulkDeleteJobs(args: { status?: string; top?: number }) {
+  requireEnv();
+  const statusFilters: Record<string, string> = {
+    waiting: "statuscode eq 10",
+    running: "statuscode eq 20",
+    completed: "statecode eq 3 and statuscode eq 30",
+    failed: "statecode eq 3 and statuscode eq 33",
+    cancelled: "statecode eq 3 and statuscode eq 32",
+  };
+  const top = Math.min(args.top ?? 20, 100);
+  const statusClause = args.status && statusFilters[args.status] ? ` and (${statusFilters[args.status]})` : "";
+  return d365(
+    `asyncoperations?$filter=operationtype eq 13${statusClause}&$select=asyncoperationid,name,statecode,statuscode,createdon,completedon,message&$orderby=createdon desc&$top=${top}`
+  );
+}
+
+async function handleGetBulkDeleteJob(args: { job_id: string }) {
+  requireEnv();
+  return d365(
+    `asyncoperations(${args.job_id})?$select=asyncoperationid,name,statecode,statuscode,createdon,completedon,message,operationtype`
+  );
+}
+
+async function handleCancelBulkDeleteJob(args: { job_id: string }) {
+  requireEnv();
+  return d365(`asyncoperations(${args.job_id})`, "DELETE");
+}
+
+async function handleGetBulkDeleteFailures(args: { job_id: string; top?: number }) {
+  requireEnv();
+  const top = Math.min(args.top ?? 50, 500);
+  return d365(
+    `bulkdeletefailures?$filter=asyncoperationid/asyncoperationid eq ${args.job_id}&$select=bulkdeletefailureid,objectid,orderfailure,errordescription&$top=${top}`
+  );
 }
 
 // ───────────────────────────── Security & Users ──────────────────────────────
@@ -2517,6 +2669,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "execute_fetchxml": result = await handleExecuteFetchXml(args as any); break;
       case "execute_action": result = await handleExecuteAction(args as any); break;
       case "associate_records": result = await handleAssociateRecords(args as any); break;
+      // Bulk Delete
+      case "create_bulk_delete_job": result = await handleCreateBulkDeleteJob(args as any); break;
+      case "list_bulk_delete_jobs": result = await handleListBulkDeleteJobs(args as any); break;
+      case "get_bulk_delete_job": result = await handleGetBulkDeleteJob(args as any); break;
+      case "cancel_bulk_delete_job": result = await handleCancelBulkDeleteJob(args as any); break;
+      case "get_bulk_delete_failures": result = await handleGetBulkDeleteFailures(args as any); break;
       // Security & Users
       case "get_current_user": result = await handleGetCurrentUser(); break;
       case "find_users": result = await handleFindUsers(args as any); break;
