@@ -1,6 +1,6 @@
 {
   "name": "dynamics365-mcp-server",
-  "version": "5.0.0",
+  "version": "6.0.0",
   "description": "MCP server for Dynamics 365 / Dataverse — 67 tools for metadata, CRUD, plugins, solutions, security, ALM, and more.",
   "type": "module",
   "main": "dist/index.js",

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Dynamics 365 MCP Server v5 — Full-Stack Dataverse Tooling + Plugin Registration
+ * Dynamics 365 MCP Server v6 — Full-Stack Dataverse Tooling + Plugin Registration
  *
  * Capabilities:
  *   - Multi-environment management (configurable via D365_ENVIRONMENTS env var)
@@ -15,10 +15,14 @@
  *   - Organization settings (trace log toggle)
  *   - Batch operations
  *
- * Required env vars:
- *   D365_TENANT_ID, D365_CLIENT_ID, D365_CLIENT_SECRET
+ * Authentication (delegated — sign in as yourself, no client secret):
+ *   Tokens are acquired as the signed-in user via your Azure CLI session. Run `az login`
+ *   (or call the `authenticate` tool, which can run it for you), and your Dataverse writes
+ *   are attributed to the real human, not an app registration.
  *
  * Optional env vars:
+ *   D365_TENANT_ID        — Azure AD tenant (GUID) to sign in against; omit to use your az default
+ *   D365_PUBLIC_CLIENT_ID — Public client ID for the opt-in device-code flow (defaults to Azure CLI client)
  *   D365_ORG_URL          — Single org URL (auto-selected, no need to call select_environment)
  *   D365_ENVIRONMENTS     — Multiple orgs. Accepts either:
  *                            JSON: [{"name":"Dev","url":"https://myorg-dev.crm.dynamics.com"}]
@@ -36,12 +40,20 @@ import {
   ListResourceTemplatesRequestSchema,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
+import { AzureCliCredential, DeviceCodeCredential } from "@azure/identity";
+import { spawn } from "child_process";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-let TENANT_ID = process.env.D365_TENANT_ID ?? "";
-let CLIENT_ID = process.env.D365_CLIENT_ID ?? "";
-let CLIENT_SECRET = process.env.D365_CLIENT_SECRET ?? "";
+// Delegated auth: tokens are minted as the signed-in *user* (via the Azure CLI), never as an
+// app — so Dataverse stamps createdby/modifiedby with the real human. No client secret.
+let TENANT_ID = process.env.D365_TENANT_ID ?? "";   // optional: pin a tenant; else the az default is used
+
+// Public client ID for the opt-in device-code flow. NOT a secret: the Azure CLI's well-known
+// first-party client is a *public* client (allows device-code with zero app-registration setup).
+// Override only with another *public* client via D365_PUBLIC_CLIENT_ID.
+const AZURE_CLI_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46";
+const PUBLIC_CLIENT_ID = process.env.D365_PUBLIC_CLIENT_ID || AZURE_CLI_CLIENT_ID;
 const API_VERSION = process.env.D365_API_VERSION ?? "9.2";
 
 interface D365Environment { name: string; url: string; }
@@ -96,30 +108,132 @@ function getBaseUrl(): string {
   return `${activeEnvironment.url}/api/data/v${API_VERSION}`;
 }
 
-// ─── Token Cache ──────────────────────────────────────────────────────────────
+// ─── Delegated Auth ─────────────────────────────────────────────────────────
+// Tokens are acquired as the signed-in *user* (Azure CLI session, or an opt-in device-code
+// sign-in), never as an app — so Dataverse stamps createdby/modifiedby with the real human.
 
 const tokenCache = new Map<string, { value: string; expiresAt: number }>();
 
+// The credential that established the current session (CLI or device-code), reused for silent
+// refresh so the identity never changes underneath the user mid-session.
+let activeCredential: AzureCliCredential | DeviceCodeCredential | null = null;
+let cliCredential: AzureCliCredential | null = null;
+let deviceCredential: DeviceCodeCredential | null = null;
+
+// Device-code state — surfaced through authenticate/auth_status, never stdout (the MCP channel).
+let pendingDeviceCode: { verificationUri: string; userCode: string } | null = null;
+let deviceLoginInFlight: Promise<void> | null = null;
+let deviceLoginError: string | null = null;
+
+/** The `az login` command for the configured tenant (tenant is optional for this generic server). */
+function azLoginCmd(): string {
+  return TENANT_ID ? `az login --tenant ${TENANT_ID}` : "az login";
+}
+
+function getCliCredential(): AzureCliCredential {
+  return (cliCredential ??= new AzureCliCredential(TENANT_ID ? { tenantId: TENANT_ID } : {}));
+}
+
+function getDeviceCredential(): DeviceCodeCredential {
+  return (deviceCredential ??= new DeviceCodeCredential({
+    ...(TENANT_ID ? { tenantId: TENANT_ID } : {}),
+    clientId: PUBLIC_CLIENT_ID,
+    // Don't auto-prompt inside getToken() — interactive sign-in happens only via authenticate.
+    disableAutomaticAuthentication: true,
+    userPromptCallback: (info: { verificationUri: string; userCode: string; message: string }) => {
+      pendingDeviceCode = { verificationUri: info.verificationUri, userCode: info.userCode };
+    },
+  }));
+}
+
+type AzLoginResult = { ok: true } | { ok: false; reason: "not_installed" | "timeout" | "failed"; message: string };
+
+/** Run `az login` for the user (opens a browser; blocks until they finish). Cross-platform; never throws. */
+function runAzLogin(timeoutMs = 180_000): Promise<AzLoginResult> {
+  return new Promise((resolve) => {
+    // shell:true resolves az/az.cmd via PATH on macOS and Windows. TENANT_ID is a GUID — no injection.
+    const child = spawn(`${azLoginCmd()} --only-show-errors`, { shell: true, stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr?.on("data", (d) => { stderr += d.toString(); });
+    const timer = setTimeout(() => { child.kill(); resolve({ ok: false, reason: "timeout", message: "timed out — no sign-in completed within 3 minutes." }); }, timeoutMs);
+    child.on("error", () => { clearTimeout(timer); resolve({ ok: false, reason: "not_installed", message: "the Azure CLI (az) isn't installed or isn't on PATH." }); });
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      if (code === 0) return resolve({ ok: true });
+      // With shell:true a missing `az` exits 127 ("command not found" / "not recognized").
+      const notInstalled = code === 127 || /not found|not recognized|no such file/i.test(stderr);
+      const tail = stderr.trim().split("\n").slice(-2).join(" ");
+      resolve({ ok: false, reason: notInstalled ? "not_installed" : "failed", message: tail || `az exited with code ${code}` });
+    });
+  });
+}
+
+/** Cross-platform Azure CLI install + sign-in instructions (tenant-aware). */
+function azInstallHint(): string {
+  return (
+    "Install the Azure CLI, then sign in (a browser opens — pick your account):\n" +
+    "  • macOS:   brew install azure-cli\n" +
+    "  • Windows: winget install --id Microsoft.AzureCLI\n" +
+    "  • Linux:   curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash\n" +
+    "  • then:    " + azLoginCmd()
+  );
+}
+
+/**
+ * Recognize an Entra Conditional Access / device-code-flow block and return actionable guidance.
+ * The branded "You don't have access to this … an authentication flow that is restricted by your
+ * admin" page is a CA block, NOT a credential problem — the user signed in fine. Many tenants block
+ * the device-code flow by policy, so we steer them to the browser-based `az login` flow.
+ */
+function conditionalAccessHelp(message: string): string | null {
+  const m = (message || "").toLowerCase();
+  const blocked =
+    m.includes("aadsts53003") ||            // access blocked by Conditional Access policies
+    m.includes("aadsts7000218") ||          // public client flow not enabled on the app
+    m.includes("conditional access") ||
+    m.includes("authentication flow") ||
+    m.includes("does not meet the criteria") ||
+    m.includes("not have access to this");
+  if (!blocked) return null;
+  return (
+    "Your sign-in succeeded, but a Conditional Access policy blocked this flow " +
+    '("an authentication flow that is restricted by your admin"). Many tenants block the ' +
+    "device-code flow by policy (it's a known phishing vector).\n\n" +
+    "✅ Use the browser-based Azure CLI flow instead, which Conditional Access typically allows:\n" +
+    azInstallHint() +
+    "\nThen call auth_status (or just run any tool)."
+  );
+}
+
+/** Best-effort identity (UPN/email) from a Dataverse access token, for display only. */
+function identityFromToken(token: string): string | null {
+  try {
+    const payload = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf-8"));
+    return payload.upn || payload.preferred_username || payload.unique_name || payload.email || null;
+  } catch { return null; }
+}
+
+/** Acquire a Dataverse token for orgUrl as the signed-in user. Silent — never prompts. */
 async function getAccessToken(orgUrl: string): Promise<string> {
   const cached = tokenCache.get(orgUrl);
   if (cached && Date.now() < cached.expiresAt - 60_000) return cached.value;
-  if (!TENANT_ID || !CLIENT_ID || !CLIENT_SECRET)
-    throw new Error("NOT_AUTHENTICATED: Call authenticate with your tenant_id, client_id, and client_secret, or set D365_TENANT_ID, D365_CLIENT_ID, D365_CLIENT_SECRET env vars.");
-  const res = await fetch(
-    `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: "client_credentials", client_id: CLIENT_ID,
-        client_secret: CLIENT_SECRET, scope: `${orgUrl}/.default`,
-      }).toString(),
-    }
-  );
-  if (!res.ok) throw new Error(`Token error ${res.status}: ${await res.text()}`);
-  const data = (await res.json()) as { access_token: string; expires_in: number };
-  tokenCache.set(orgUrl, { value: data.access_token, expiresAt: Date.now() + data.expires_in * 1000 });
-  return data.access_token;
+
+  const scope = `${orgUrl}/.default`;
+  const cred = activeCredential ?? getCliCredential(); // fall back to an existing `az login` session
+  let result: { token: string; expiresOnTimestamp: number } | null = null;
+  try {
+    result = await cred.getToken(scope);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `NOT_AUTHENTICATED: couldn't get a Dataverse token as you. ` +
+      `Run \`${azLoginCmd()}\` (or call authenticate), then retry. (${msg})`
+    );
+  }
+  if (!result) throw new Error(`NOT_AUTHENTICATED: call authenticate to sign in, or run \`${azLoginCmd()}\`.`);
+  activeCredential ??= cred; // remember the CLI credential if it worked implicitly
+  tokenCache.set(orgUrl, { value: result.token, expiresAt: result.expiresOnTimestamp });
+  return result.token;
 }
 
 // ─── HTTP Helpers ─────────────────────────────────────────────────────────────
@@ -215,15 +329,13 @@ const tools: Tool[] = [
   // ───────────────────────────── AUTH ─────────────────────────────────────────
   {
     name: "authenticate",
-    description: "Provide Azure AD app credentials to authenticate. Call this before any other tool if credentials were not set via env vars. Accepts tenant_id, client_id, and client_secret.",
+    description: "Sign in as yourself (delegated auth) so your creates/updates are attributed to you, not an app. No client secret. Uses your existing `az login` session, otherwise runs `az login` for you (opens a browser — the Conditional-Access-friendly auth-code flow). The Azure CLI is required; if it isn't installed you'll get install instructions. Device-code sign-in is opt-in only (often blocked by Conditional Access).",
     inputSchema: {
       type: "object",
       properties: {
-        tenant_id: { type: "string", description: "Azure AD tenant ID (GUID)" },
-        client_id: { type: "string", description: "Azure AD app registration Client ID" },
-        client_secret: { type: "string", description: "Azure AD app registration Client Secret" },
+        method: { type: "string", enum: ["auto", "cli", "az_login", "device_code"], description: "auto (default): existing az session → else run `az login` for you (browser); if the Azure CLI is missing, returns install steps. cli: existing az session only. az_login: run `az login` now (opens browser). device_code: device-code flow — opt-in only, often blocked by Conditional Access." },
+        tenant_id: { type: "string", description: "Optional Azure AD tenant (GUID) to sign in against. Defaults to D365_TENANT_ID or your az default tenant." },
       },
-      required: ["tenant_id", "client_id", "client_secret"],
     },
   },
   {
@@ -1290,24 +1402,148 @@ const tools: Tool[] = [
 
 // ───────────────────────────── Auth ───────────────────────────────────────────
 
-function handleAuthenticate(args: { tenant_id: string; client_id: string; client_secret: string }): string {
-  if (!args.tenant_id?.trim()) throw new Error("tenant_id cannot be empty.");
-  if (!args.client_id?.trim()) throw new Error("client_id cannot be empty.");
-  if (!args.client_secret?.trim()) throw new Error("client_secret cannot be empty.");
-  TENANT_ID = args.tenant_id.trim();
-  CLIENT_ID = args.client_id.trim();
-  CLIENT_SECRET = args.client_secret.trim();
-  tokenCache.clear();
-  return "✓ Authenticated. Call list_environments to see available environments, then select_environment to pick one.";
+async function handleAuthenticate(args: { method?: string; tenant_id?: string }): Promise<string> {
+  const method = args.method ?? "auto";
+  // Optional tenant override — reset cached credentials if it changes the tenant.
+  if (args.tenant_id?.trim() && args.tenant_id.trim() !== TENANT_ID) {
+    TENANT_ID = args.tenant_id.trim();
+    cliCredential = null; deviceCredential = null; activeCredential = null; tokenCache.clear();
+  }
+
+  const env = activeEnvironment ?? ENVIRONMENTS[0] ?? null;
+  if (!env) {
+    return "No environment configured yet. Set D365_ORG_URL or D365_ENVIRONMENTS, or call add_environment, then call authenticate.";
+  }
+  const probeScope = `${env.url}/.default`;
+
+  // Already signed in? Confirm silently.
+  if (method === "auto" && activeCredential) {
+    try {
+      const tok = await activeCredential.getToken(probeScope);
+      if (tok) return signedInMessage(tok.token, "already signed in");
+    } catch { activeCredential = null; /* expired — re-auth below */ }
+  }
+
+  // 1) Existing Azure CLI session (silent).
+  if (method === "auto" || method === "cli") {
+    try {
+      const tok = await getCliCredential().getToken(probeScope);
+      if (tok) {
+        activeCredential = getCliCredential();
+        tokenCache.clear();
+        return signedInMessage(tok.token, "signed in via Azure CLI");
+      }
+    } catch (err) {
+      if (method === "cli") {
+        return `✗ No usable \`az login\` session.\n\nRun \`${azLoginCmd()}\`, or call authenticate with method "az_login" to have me run it for you. (${err instanceof Error ? err.message : String(err)})`;
+      }
+      // method "auto": fall through and run az login for them.
+    }
+  }
+
+  // 2) Run `az login` for the user (opens a browser; auth-code flow — Conditional-Access-friendly).
+  if (method === "auto" || method === "az_login") {
+    const az = await runAzLogin();
+    if (az.ok) {
+      cliCredential = null; // re-read the freshly created session
+      try {
+        const tok = await getCliCredential().getToken(probeScope);
+        if (tok) {
+          activeCredential = getCliCredential();
+          tokenCache.clear();
+          return signedInMessage(tok.token, "signed in via az login");
+        }
+      } catch (err) {
+        const m = err instanceof Error ? err.message : String(err);
+        return conditionalAccessHelp(m) ?? `⚠ az login completed but couldn't get a token: ${m}`;
+      }
+    } else if (az.reason === "not_installed") {
+      // The Azure CLI is required. Don't fall back to device-code — it's commonly blocked by
+      // Conditional Access and only yields a cryptic "authentication flow restricted" page.
+      return `✗ The Azure CLI isn't installed — it's required to sign in.\n\n${azInstallHint()}\n\nThen call authenticate again.`;
+    } else {
+      const help = conditionalAccessHelp(az.message);
+      if (help) return `✗ Sign-in was blocked.\n\n${help}`;
+      return `✗ Couldn't complete az login: ${az.message}\n\nTry \`${azLoginCmd()}\` yourself, then call auth_status.`;
+    }
+  }
+
+  // Only an explicit method "device_code" reaches the device-code flow below. auto/cli/az_login
+  // never silently attempt it, because it's frequently blocked by Conditional Access.
+  if (method !== "device_code") {
+    return `✗ Couldn't establish a session.\n\n${azInstallHint()}\n\nIf the CLI is already installed, run \`${azLoginCmd()}\` and call auth_status.`;
+  }
+
+  // 3) Device-code sign-in — opt-in only. Two-phase: return the code now, finish in the background.
+  if (deviceLoginInFlight && pendingDeviceCode && !activeCredential) {
+    return deviceCodePrompt("Sign-in already in progress");
+  }
+  const cred = getDeviceCredential();
+  pendingDeviceCode = null;
+  deviceLoginError = null;
+  deviceLoginInFlight = cred.authenticate(probeScope)
+    .then(() => { activeCredential = cred; tokenCache.clear(); pendingDeviceCode = null; })
+    .catch((err) => { deviceLoginError = err instanceof Error ? err.message : String(err); })
+    .finally(() => { deviceLoginInFlight = null; });
+
+  // Wait briefly for Entra to issue the code (userPromptCallback fires within ~1s).
+  for (let i = 0; i < 30 && !pendingDeviceCode && !deviceLoginError; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  if (deviceLoginError) {
+    const e = deviceLoginError; deviceLoginError = null;
+    const help = conditionalAccessHelp(e);
+    return help ? `✗ Device-code sign-in was blocked.\n\n${help}` : `✗ Sign-in failed: ${e}`;
+  }
+  if (!pendingDeviceCode) return "Starting sign-in… call auth_status in a moment to get your device code.";
+  return deviceCodePrompt("🔐 Device sign-in started");
 }
 
-function handleAuthStatus(): string {
-  const authenticated = !!(CLIENT_ID && CLIENT_SECRET);
-  const envInfo = activeEnvironment ? `Active environment: ${activeEnvironment.name} (${activeEnvironment.url})` : "No environment selected yet.";
-  if (authenticated) {
-    return `✓ Authenticated (client_id: ${CLIENT_ID.slice(0, 8)}...).\n${envInfo}\n\nAvailable environments: ${ENVIRONMENTS.map((e) => e.name).join(", ") || "none — use add_environment or list_environments"}`;
+function deviceCodePrompt(prefix: string): string {
+  return `${prefix}.\n\n👉 Open ${pendingDeviceCode!.verificationUri} and enter code: ${pendingDeviceCode!.userCode}\n\n` +
+    "After you approve in the browser, call auth_status (or just run any tool). Your writes will be attributed to you.";
+}
+
+function signedInMessage(token: string, how: string): string {
+  const who = identityFromToken(token);
+  const envInfo = activeEnvironment
+    ? `Active environment: ${activeEnvironment.name}.`
+    : (ENVIRONMENTS.length ? "Call list_environments → select_environment to pick one." : "No environments configured — use add_environment.");
+  return `✓ ${how}${who ? ` as ${who}` : ""}. Your Dataverse writes are now attributed to you.\n${envInfo}`;
+}
+
+async function handleAuthStatus(): Promise<string> {
+  const env = activeEnvironment ?? ENVIRONMENTS[0] ?? null;
+  const probe = env ? `${env.url}/.default` : null;
+
+  if (deviceLoginError) {
+    const e = deviceLoginError; deviceLoginError = null; pendingDeviceCode = null;
+    const help = conditionalAccessHelp(e);
+    return help ? `✗ Device-code sign-in was blocked.\n\n${help}` : `✗ Sign-in failed: ${e}\n\nCall authenticate to try again.`;
   }
-  return "✗ Not authenticated.\n\nCall authenticate with your Azure AD tenant_id, client_id, and client_secret. Alternatively, set D365_TENANT_ID, D365_CLIENT_ID, and D365_CLIENT_SECRET env vars before starting the server.";
+  if (deviceLoginInFlight && pendingDeviceCode) return deviceCodePrompt("⏳ Waiting for you to finish sign-in");
+
+  // No active credential yet? See if an existing `az login` session works (needs a scope to probe).
+  if (!activeCredential && probe) {
+    try { const tok = await getCliCredential().getToken(probe); if (tok) activeCredential = getCliCredential(); } catch { /* no session */ }
+  }
+
+  const envInfo = activeEnvironment
+    ? `Active environment: ${activeEnvironment.name} (${activeEnvironment.url})`
+    : (ENVIRONMENTS.length ? `Available environments: ${ENVIRONMENTS.map((e) => e.name).join(", ")} — call select_environment.` : "No environment configured — set D365_ORG_URL / D365_ENVIRONMENTS or use add_environment.");
+
+  if (!activeCredential) {
+    return `✗ Not signed in.\n\nRun \`${azLoginCmd()}\` then call any tool, or call authenticate to sign in.\n${envInfo}`;
+  }
+  try {
+    const tok = probe ? await activeCredential.getToken(probe) : null;
+    pendingDeviceCode = null;
+    const who = tok ? identityFromToken(tok.token) : null;
+    return `✓ Signed in${who ? ` as ${who}` : ""}.\n${envInfo}`;
+  } catch (err) {
+    activeCredential = null;
+    return `⚠ Session expired: ${err instanceof Error ? err.message : String(err)}\n\nCall authenticate to sign in again.`;
+  }
 }
 
 // ───────────────────────────── Environment ────────────────────────────────────
@@ -2567,7 +2803,7 @@ async function handleExecuteBatch(args: { requests: Array<{ method: string; url:
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const server = new Server(
-  { name: "dynamics365-mcp", version: "5.0.0" },
+  { name: "dynamics365-mcp", version: "6.0.0" },
   { capabilities: { tools: {}, resources: {} } }
 );
 
@@ -2645,8 +2881,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     let result: unknown;
     switch (name) {
       // Auth
-      case "authenticate": result = handleAuthenticate(args as any); break;
-      case "auth_status": result = handleAuthStatus(); break;
+      case "authenticate": result = await handleAuthenticate(args as any); break;
+      case "auth_status": result = await handleAuthStatus(); break;
       // Environment
       case "list_environments": result = handleListEnvironments(); break;
       case "select_environment": result = handleSelectEnvironment(args as any); break;
@@ -2758,10 +2994,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 async function main() {
-  const authReady = TENANT_ID && CLIENT_ID && CLIENT_SECRET;
-  if (!authReady) console.error("D365 MCP v5 ready. Not authenticated — call authenticate with tenant_id, client_id, and client_secret, or set env vars.");
-  else if (!ENVIRONMENTS.length) console.error("D365 MCP v5 ready. Authenticated. No environments pre-configured — use add_environment.");
-  else console.error(`D365 MCP v5 ready. Authenticated. ${ENVIRONMENTS.length} env(s): ${ENVIRONMENTS.map((e) => e.name).join(", ")}${activeEnvironment ? ` [active: ${activeEnvironment.name}]` : ""}`);
+  const envInfo = ENVIRONMENTS.length
+    ? `${ENVIRONMENTS.length} env(s): ${ENVIRONMENTS.map((e) => e.name).join(", ")}${activeEnvironment ? ` [active: ${activeEnvironment.name}]` : ""}`
+    : "no environments pre-configured — use add_environment";
+  console.error(`D365 MCP v6 ready (delegated auth — signs in as you via az login). ${envInfo}.`);
   await server.connect(new StdioServerTransport());
 }
 main().catch((e) => { console.error("Fatal:", e); process.exit(1); });

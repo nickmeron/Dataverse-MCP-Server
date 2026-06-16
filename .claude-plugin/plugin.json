@@ -1,7 +1,7 @@
 {
   "name": "dynamics365-dataverse",
   "description": "Full-stack Dynamics 365 / Dataverse plugin for Claude — 67 MCP tools + 18 skills for metadata exploration, CRUD, plugin management, solution ALM, security auditing, web resources, and more.",
-  "version": "5.0.0",
+  "version": "6.0.0",
   "author": {
     "name": "Dataverse MCP Server"
   },
