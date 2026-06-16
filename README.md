@@ -10,7 +10,7 @@ MCP server that gives Claude (or any MCP client) full access to Microsoft Dynami
 
 | Category | Tools | Examples |
 |----------|-------|---------|
-| Auth | 2 | Authenticate interactively or via env vars |
+| Auth | 2 | Sign in as yourself via `az login` (delegated, no secret) |
 | Environment | 3 | Switch between Dev / Test / Prod at runtime |
 | Metadata | 8 | Entities, fields, relationships, option sets, keys |
 | Data (CRUD) | 8 | Query, create, update, delete, FetchXML, batch |
@@ -32,9 +32,9 @@ MCP server that gives Claude (or any MCP client) full access to Microsoft Dynami
 ## Prerequisites
 
 - **Node.js** 18+
-- **Azure AD App Registration** with:
-  - `Dynamics CRM > user_impersonation` permission (or application-level access)
-  - Client secret or certificate
+- **Azure CLI** (`az`) — used for delegated sign-in:
+  - macOS: `brew install azure-cli` · Windows: `winget install --id Microsoft.AzureCLI` · Linux: `curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash`
+- A **Dynamics 365 user account** with access to your environment(s) — your own Dataverse security roles govern what you can do (no app registration or client secret needed)
 - **Dynamics 365 environment URL(s)**
 
 ---
@@ -69,7 +69,7 @@ cp -r skills/* ~/.claude/skills/
 xcopy /E /I skills\* "%USERPROFILE%\.claude\skills\"
 ```
 
-### 4. Authenticate
+### 4. Sign in
 
 Run `/mcp` in Claude Code — you should see `dynamics365 · ✓ connected`.
 
@@ -77,39 +77,35 @@ Then say:
 
 > "Connect to Dataverse"
 
-Claude will call `auth_status`, see you're not authenticated, and ask for your **Tenant ID**, **Client ID**, and **Client Secret**. Credentials are held **in memory only** — never written to disk.
+Claude calls `authenticate`, which uses your existing `az login` session — or runs `az login` for you (a browser opens; just pick your account). You sign in **as yourself**, so your creates/updates are attributed to the real you, not an app. **No client secret.**
 
 ---
 
 ## Authentication
 
-### Option A — Interactive (recommended for first-time setup)
+Delegated — you sign in with your **own** Azure AD identity (via the Azure CLI), so Dataverse stamps `createdby` / `modifiedby` with the real human. **No client secret**, and access is governed by your own Dataverse security roles.
 
-Just open Claude Code and say `"Connect to Dataverse"`. Claude will call `auth_status`, see you're not authenticated, and ask for your credentials interactively.
+Say `"Connect to Dataverse"` and the server signs you in, in this order:
 
-Or provide them directly:
-```
-"Connect to Dataverse with tenant ID <id>, client ID <id>, and secret <secret>"
-```
+1. **Existing `az login` session** — used silently if present.
+2. **Runs `az login` for you** — opens a browser; just pick your account. This is the browser-based auth-code flow, which Conditional Access allows.
+3. **Azure CLI required** — if it isn't installed, `authenticate` returns one-line install instructions for your OS.
 
-Credentials are held **in memory only** — never written to disk.
+> **Device-code sign-in is opt-in only** (`authenticate` with `method: "device_code"`) and is frequently blocked by Conditional Access — the *"an authentication flow that is restricted by your admin"* page. The browser `az login` flow above is the supported path.
 
-### Option B — Environment variables
+### Optional: pin a tenant
+
+Set `D365_TENANT_ID` to sign in against a specific tenant (otherwise your `az` default tenant is used):
 
 ```bash
 claude mcp add dynamics365 -t stdio \
   -e D365_TENANT_ID=your-tenant-id \
-  -e D365_CLIENT_ID=your-client-id \
-  -e D365_CLIENT_SECRET=your-client-secret \
   -- node /full/path/to/dataverse-mcp-server/mcp-server/dist/index.js
 ```
 
-### Get your Azure AD credentials
+### Grant yourself access
 
-1. Go to [Azure Portal → App Registrations](https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade)
-2. Find or create an app registration with `Dynamics CRM > user_impersonation` permission
-3. Copy the **Directory (tenant) ID** and **Application (client) ID** from the Overview page
-4. Go to **Certificates & secrets** → **New client secret** → copy the **Value**
+Assign your user a **Dataverse security role** in the target environment (Power Platform admin center → Environment → Users + permissions). No app registration or client secret is required.
 
 ---
 
@@ -161,8 +157,6 @@ and it calls `add_environment` for you.
       "args": ["/full/path/to/dataverse-mcp-server/mcp-server/dist/index.js"],
       "env": {
         "D365_TENANT_ID": "your-tenant-id",
-        "D365_CLIENT_ID": "your-client-id",
-        "D365_CLIENT_SECRET": "your-client-secret",
         "D365_ORG_URL": "https://yourorg.crm.dynamics.com"
       }
     }
@@ -201,11 +195,10 @@ Skills are `SKILL.md` files that give Claude domain-specific guidance. See [Quic
 
 ## Security
 
-- **Never** hardcode credentials in source files
-- **Never** commit `.env` files — they are in `.gitignore`
-- Use Azure Key Vault or environment variables in production
-- The MCP server uses OAuth 2.0 Client Credentials flow
-- All tokens are cached **in memory only** and expire automatically
+- **Delegated auth** — you sign in as yourself via `az login`; there is **no client secret** to store or leak
+- Access is governed by your own Dynamics 365 security roles
+- The server uses the OAuth 2.0 authorization-code flow via the Azure CLI (device-code is opt-in only)
+- All tokens are cached **in memory only** and refreshed automatically from your `az` session
 - See `.env.example` for the full list of supported variables
 
 ---
