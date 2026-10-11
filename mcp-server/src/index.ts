@@ -14,6 +14,7 @@
  *   - SDK Message & Message Filter browsing
  *   - Organization settings (trace log toggle)
  *   - Batch operations
+ *   - Power Automate cloud flows (CRUD, on/off, run history, connection references)
  *
  * Authentication (delegated — sign in as yourself, no client secret):
  *   Tokens are acquired as the signed-in user via your Azure CLI session. Run `az login`
@@ -1392,6 +1393,173 @@ const tools: Tool[] = [
         },
       },
       required: ["requests"],
+    },
+  },
+
+  // ───────────────────────── POWER AUTOMATE (CLOUD FLOWS) ────────────────────
+  {
+    name: "list_cloud_flows",
+    description: "List Power Automate cloud flows (Dataverse workflow rows with category 5) — id, name, On/Off, type (Power Automate / Copilot Studio agent flow / M365 agent flow), managed, owner. Filter by name, state, solution, the Dataverse table that triggers them, or any text inside their definition (impact analysis: which flows reference a field, env var, child flow id, connector).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name_contains: { type: "string", description: "Substring of the flow name" },
+        state: { type: "string", enum: ["on", "off", "all"], description: "Default all" },
+        solution: { type: "string", description: "Solution unique name — only flows in that solution" },
+        flow_type: { type: "string", enum: ["power_automate", "copilot_studio", "m365_agent", "all"], description: "Default all" },
+        trigger_table: { type: "string", description: "Only flows with a Dataverse row trigger on this table logical name (e.g. 'incident'); adds the trigger's change type/filters to each result" },
+        definition_contains: { type: "string", description: "Only flows whose definition JSON contains this text (case-insensitive), e.g. a column name, an environment variable schema name, a child flow id" },
+        include_managed: { type: "boolean", description: "Default true. false = only unmanaged flows (the ones authored in this org)" },
+        top: { type: "number", description: "Max results (default 100, max 500)" },
+      },
+    },
+  },
+  {
+    name: "get_cloud_flow",
+    description: "Read one cloud flow: state, owner, solutions, a trigger summary (for Dataverse triggers: table, change type, scope, filtering attributes), an action outline, each connection reference with whether it exists/is bound/who owns it, the 5 latest runs, a maker-portal link, `version` (pass to update_cloud_flow as expected_version), and the full `definition` JSON to edit. For On flows with a Dataverse trigger it also checks the trigger is actually registered — a flow can be On and never fire.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        flow_id: { type: "string", description: "workflowid GUID (from list_cloud_flows). Preferred." },
+        name: { type: "string", description: "Exact flow name, if you have no id. Fails if several flows share it." },
+        include_definition: { type: "boolean", description: "Default true. false = summary only (large flows can be 100KB+)." },
+      },
+    },
+  },
+  {
+    name: "validate_cloud_flow",
+    description: "Dry-run check of a cloud flow definition against this environment — writes nothing. Catches what turning a flow on would reject (bad runAfter targets, unterminated @{ expressions, connector actions whose connectionName is not a declared connection reference, missing/unbound/mismatched connection references, Dataverse table names — the row trigger takes the logical name, actions take the entity set name) and Dataverse-trigger mistakes that activation does NOT reject but that stop the flow ever firing (e.g. filteringattributes on a Created-only trigger). create/update_cloud_flow run the same checks.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        definition: { type: "object", description: "The Logic Apps definition ({ triggers, actions, ... }) — or a whole clientdata / properties object, as returned by get_cloud_flow or the portal's Peek code." },
+        connection_references: { type: "object", description: "Map of connectionName key → connection reference logical name, e.g. { \"shared_commondataserviceforapps\": \"new_sharedcommondataserviceforapps_a1b2c\" }. Keys must equal the inputs.host.connectionName used by actions." },
+      },
+      required: ["definition"],
+    },
+  },
+  {
+    name: "create_cloud_flow",
+    description: "Create a solution-aware Power Automate cloud flow in Dataverse. Validates first (same checks as validate_cloud_flow) and writes nothing on error; adds the $connections/$authentication parameters and schema boilerplate if missing. Pass `solution` so it travels with ALM — without it the flow lands in the Default solution. Created Off by default; Draft flows are NOT validated by the Flow service, so pass activate: true (or call set_cloud_flow_state) to validate and deploy. Activation takes ~10s; for Dataverse triggers the tool then confirms the webhook registered. Use connection references you own — someone else's connection fails with 'Cannot find connection'. Author in a development environment, never directly in production.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Flow display name" },
+        definition: { type: "object", description: "The Logic Apps definition: { triggers: {<one trigger>}, actions: {...} }. A full clientdata or properties object is also accepted." },
+        connection_references: { type: "object", description: "Map of connectionName key → connection reference logical name, e.g. { \"shared_commondataserviceforapps\": \"new_sharedcommondataserviceforapps_a1b2c\" }. Every connector action's inputs.host.connectionName must be one of these keys. Find references with list_connection_references." },
+        description: { type: "string" },
+        solution: { type: "string", description: "Unique name of the unmanaged solution to create it in (strongly recommended)" },
+        activate: { type: "boolean", description: "Turn the flow on after creating it (default false). If activation fails the flow stays, Off, and the cause + fix are returned." },
+      },
+      required: ["name", "definition"],
+    },
+  },
+  {
+    name: "update_cloud_flow",
+    description: "Update a cloud flow's name, description, definition (full replacement — read it with get_cloud_flow, edit, send back) and/or connection references. Validates first. If the flow is On, the Flow service validates and deploys the change immediately, and rejects it as a whole if invalid (the flow keeps running its previous definition). If Off, the change is stored unvalidated — turn it on to validate. Pass expected_version (from get_cloud_flow) to refuse the write if someone saved the flow since you read it. Refuses managed flows (that would create an unmanaged layer over the managed solution) unless allow_managed is true.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        flow_id: { type: "string", description: "workflowid GUID" },
+        name: { type: "string" },
+        description: { type: "string" },
+        definition: { type: "object", description: "Complete new Logic Apps definition (not a patch)." },
+        connection_references: { type: "object", description: "connectionName key → connection reference logical name. Merged over the flow's existing references." },
+        expected_version: { type: "string", description: "The `version` from get_cloud_flow — optimistic concurrency (If-Match)." },
+        allow_managed: { type: "boolean", description: "Default false. true = deliberately create an unmanaged layer on a managed flow." },
+      },
+      required: ["flow_id"],
+    },
+  },
+  {
+    name: "set_cloud_flow_state",
+    description: "Turn a cloud flow on, off, or restart it (off then on). Turning on is where the Flow service validates the definition and connections; failures come back with their real cause and fix (e.g. 'Cannot find connection' = the connection is not shared with you). For Dataverse-triggered flows it then confirms the trigger's webhook registered. Restart is needed after rebinding a connection reference: active flows keep their old connection until restarted.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        flow_id: { type: "string", description: "workflowid GUID" },
+        state: { type: "string", enum: ["on", "off", "restart"] },
+      },
+      required: ["flow_id", "state"],
+    },
+  },
+  {
+    name: "delete_cloud_flow",
+    description: "Permanently delete a cloud flow from Dataverse and the Flow service (works while On). Refuses managed flows, and refuses when other flows reference this flow's id (child flows) unless force is true. Irreversible — export the solution first if you may want it back.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        flow_id: { type: "string", description: "workflowid GUID" },
+        force: { type: "boolean", description: "Delete even if other flows reference it (default false)" },
+      },
+      required: ["flow_id"],
+    },
+  },
+  {
+    name: "list_cloud_flow_runs",
+    description: "Cloud flow run history from Dataverse (flowrun table): status, trigger type, start/end, duration, error code + message, and a portal link per run. Filter by flow, status, and start time; with a flow it also returns per-status counts. Runs arrive ~5 minutes after they finish, are kept 28 days, and in-progress runs are not listed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        flow_id: { type: "string", description: "workflowid GUID — omit for runs across all flows" },
+        status: { type: "string", enum: ["Succeeded", "Failed", "Cancelled"] },
+        since: { type: "string", description: "ISO date/time — only runs started at or after it" },
+        top: { type: "number", description: "Max runs (default 50, max 500), newest first" },
+      },
+    },
+  },
+  {
+    name: "cancel_cloud_flow_runs",
+    description: "Cancel every in-progress run of a cloud flow (Dataverse CancelAllCloudFlowRuns). Does not turn the flow off — new triggers still start new runs, so set_cloud_flow_state off first if it is misbehaving.",
+    inputSchema: {
+      type: "object",
+      properties: { flow_id: { type: "string", description: "workflowid GUID" } },
+      required: ["flow_id"],
+    },
+  },
+  {
+    name: "list_connection_references",
+    description: "List connection references (how solution-aware flows bind to connectors): logical name, connector, whether a connection is bound, owner, and whether you own it. Use before create_cloud_flow to pick a reference you own. include_flows adds the flows using each reference.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        connector: { type: "string", description: "Connector filter, e.g. 'commondataserviceforapps', 'keyvault', 'office365'" },
+        name_contains: { type: "string", description: "Substring of the logical or display name" },
+        unbound_only: { type: "boolean", description: "Only references with no connection" },
+        include_flows: { type: "boolean", description: "Also list the flows using each reference (max 25 references)" },
+        top: { type: "number", description: "Max results (default 100, max 500)" },
+      },
+    },
+  },
+  {
+    name: "create_connection_reference",
+    description: "Create a connection reference for a connector, optionally in a solution and already bound to a connection id (Dataverse checks the connection exists and that you can use it). Unbound references are normal for ALM — bind them per environment.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        logical_name: { type: "string", description: "Publisher-prefixed logical name, e.g. new_sharedcommondataserviceforapps_tickets" },
+        connector: { type: "string", description: "Connector api name, e.g. shared_commondataserviceforapps (or its full /providers/... id)" },
+        display_name: { type: "string" },
+        connection_id: { type: "string", description: "Connection to bind, e.g. shared-commondataser-<guid> (copy from a reference that already uses it)" },
+        description: { type: "string" },
+        solution: { type: "string", description: "Unique name of the solution to create it in" },
+      },
+      required: ["logical_name", "connector"],
+    },
+  },
+  {
+    name: "update_connection_reference",
+    description: "Rebind a connection reference to another connection, or rename it. Active flows keep the connection they were activated with, so after a rebind this lists them; restart_flows: true restarts them (up to 3 per call — also works on its own as a follow-up to an earlier rebind), otherwise restart each with set_cloud_flow_state.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        connection_reference: { type: "string", description: "Logical name or connectionreferenceid GUID" },
+        connection_id: { type: "string", description: "New connection id to bind" },
+        display_name: { type: "string" },
+        description: { type: "string" },
+        restart_flows: { type: "boolean", description: "Restart the active flows using it so they pick up the new connection (default false)" },
+      },
+      required: ["connection_reference"],
     },
   },
 ];
@@ -2799,11 +2967,1361 @@ async function handleExecuteBatch(args: { requests: Array<{ method: string; url:
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// POWER AUTOMATE (CLOUD FLOWS)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/** Escape a value for a single-quoted OData string literal (`'` → `''`). */
+function escapeODataString(value: string): string {
+  return value.replace(/'/g, "''");
+}
+
+// Pure logic for Power Automate cloud flows stored in Dataverse — no I/O here, so all of it
+// is unit-testable. `handlers/flows.ts` does the talking to Dataverse.
+//
+// A cloud flow is a `workflow` row with category 5 ("Modern Flow"). Its whole definition
+// lives in `clientdata`, a JSON *string*:
+//
+//   { "properties": { "connectionReferences": {...}, "definition": {Logic Apps template} },
+//     "schemaVersion": "1.0.0.0" }
+//
+// Everything below was established against a live Dataverse org with throwaway flows. The two
+// facts that shape the design:
+//
+//  1. Dataverse validates very little at create/update time — only that clientdata parses,
+//     has `schemaVersion`, and that every connection reference logical name exists. The
+//     Logic Apps template (runAfter targets, expressions, connector wiring) is validated only
+//     when the flow is turned ON. A Draft flow therefore stores a broken definition silently.
+//  2. "Activated" is not the same as "will fire". A Dataverse-triggered flow whose trigger
+//     parameters are wrong (e.g. filteringattributes on a Create-only trigger) activates with
+//     a 204 and then never registers its webhook. The only Dataverse-side evidence is the
+//     absence of a live `callbackregistration` named after the workflowid.
+//
+// So the lint here catches what activation would reject, with an error that names the cause,
+// plus the trigger mistakes activation does *not* reject at all.
+
+const FLOW_CATEGORY = 5;
+const DATAVERSE_API = "shared_commondataserviceforapps";
+const SCHEMA_URL =
+  "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#";
+
+const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Validate a GUID before it goes into an OData path or filter. */
+function assertGuid(value: unknown, label: string): string {
+  const v = typeof value === "string" ? value.trim().replace(/^\{|\}$/g, "") : "";
+  if (!GUID_RE.test(v)) throw new Error(`INVALID_ID: ${label} must be a GUID, got ${JSON.stringify(value)}.`);
+  return v.toLowerCase();
+}
+
+function isGuid(value: unknown): boolean {
+  return typeof value === "string" && GUID_RE.test(value.trim());
+}
+
+/** workflow.modernflowtype */
+const MODERN_FLOW_TYPES: Record<number, string> = {
+  0: "Power Automate",
+  1: "Copilot Studio agent flow",
+  2: "M365 Copilot agent flow",
+};
+
+/** SubscribeWebhookTrigger `subscriptionRequest/message` — the Dataverse "Change type" dropdown. */
+const DATAVERSE_TRIGGER_MESSAGES: Record<number, string> = {
+  1: "Added",
+  2: "Deleted",
+  3: "Modified",
+  4: "Added or Modified",
+  5: "Added or Deleted",
+  6: "Modified or Deleted",
+  7: "Added or Modified or Deleted",
+};
+/** Messages that include an Update — the only ones Dataverse lets carry filteringattributes. */
+const MESSAGES_WITH_UPDATE = new Set([3, 4, 6, 7]);
+
+/** SubscribeWebhookTrigger `subscriptionRequest/scope`. */
+const DATAVERSE_TRIGGER_SCOPES: Record<number, string> = {
+  1: "User",
+  2: "Business Unit",
+  3: "Parent: Child Business Unit",
+  4: "Organization",
+};
+
+type Json = Record<string, any>;
+
+interface ConnectionReferenceEntry {
+  runtimeSource?: string;
+  connection?: { connectionReferenceLogicalName?: string; name?: string };
+  api?: { name?: string };
+  [k: string]: unknown;
+}
+
+interface ClientData {
+  properties: {
+    connectionReferences: Record<string, ConnectionReferenceEntry>;
+    definition: Json;
+    [k: string]: unknown;
+  };
+  schemaVersion: string;
+}
+
+interface LintIssue {
+  severity: "error" | "warning";
+  code: string;
+  message: string;
+  path?: string;
+}
+
+// ─── Parsing & normalization ──────────────────────────────────────────────────
+
+/** Parse a workflow row's clientdata. Returns null for an empty or unparseable value. */
+function parseClientData(raw: unknown): ClientData | null {
+  if (typeof raw !== "string" || raw.trim() === "") return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    parsed.properties ??= {};
+    parsed.properties.connectionReferences ??= {};
+    parsed.properties.definition ??= {};
+    return parsed as ClientData;
+  } catch {
+    return null;
+  }
+}
+
+/** Accept an object, or a JSON string of one (some clients stringify object arguments). */
+function coerceObject(value: unknown, label: string): Json | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    } catch { /* fall through to the error below */ }
+    throw new Error(`INVALID_ARGUMENT: ${label} must be a JSON object.`);
+  }
+  if (typeof value !== "object" || Array.isArray(value)) throw new Error(`INVALID_ARGUMENT: ${label} must be a JSON object.`);
+  return value as Json;
+}
+
+/**
+ * Callers hand us one of three shapes, because get_cloud_flow returns the parts separately
+ * and the portal's "Peek code" / exported definition.json use the others:
+ *   - the Logic Apps definition itself            { triggers, actions, ... }
+ *   - the `properties` object                      { definition, connectionReferences }
+ *   - a whole clientdata                           { properties: { definition, ... }, schemaVersion }
+ * Returns the definition and any connection references that came embedded with it.
+ */
+function splitDefinitionInput(input: Json): { definition: Json; connectionReferences?: Record<string, ConnectionReferenceEntry> } {
+  if (input.properties && typeof input.properties === "object" && input.properties.definition) {
+    return { definition: input.properties.definition, connectionReferences: input.properties.connectionReferences };
+  }
+  if (input.definition && typeof input.definition === "object" && (input.definition.triggers || input.definition.actions)) {
+    return { definition: input.definition, connectionReferences: input.connectionReferences };
+  }
+  return { definition: input };
+}
+
+/**
+ * Fill in the boilerplate the designer always writes. Omitting `$authentication` while an
+ * action uses `@parameters('$authentication')` is not caught at save — activation then fails
+ * with an opaque 500 NullReferenceException — so both parameters are always declared.
+ * Returns what was added so the caller can report it.
+ */
+function normalizeDefinition(definition: Json): { definition: Json; added: string[] } {
+  const def: Json = { ...definition };
+  const added: string[] = [];
+  if (!def.$schema) { def.$schema = SCHEMA_URL; added.push("$schema"); }
+  if (!def.contentVersion) { def.contentVersion = "1.0.0.0"; added.push("contentVersion"); }
+  const params: Json = { ...(def.parameters ?? {}) };
+  if (!params.$connections) { params.$connections = { defaultValue: {}, type: "Object" }; added.push("parameters.$connections"); }
+  if (!params.$authentication) { params.$authentication = { defaultValue: {}, type: "SecureObject" }; added.push("parameters.$authentication"); }
+  def.parameters = params;
+  def.triggers ??= {};
+  def.actions ??= {};
+  return { definition: def, added };
+}
+
+/**
+ * Build one connectionReferences entry from a connection reference logical name. This is
+ * the exact shape the designer writes for a solution-aware flow; `runtimeSource: embedded`
+ * means the flow runs with the connection bound to the reference, not the invoker's.
+ */
+function connectionReferenceEntry(logicalName: string, apiName: string): ConnectionReferenceEntry {
+  return {
+    runtimeSource: "embedded",
+    connection: { connectionReferenceLogicalName: logicalName },
+    api: { name: apiName },
+  };
+}
+
+/** `/providers/Microsoft.PowerApps/apis/shared_x` → `shared_x`. */
+function apiNameFromConnectorId(connectorId: string | null | undefined): string {
+  if (!connectorId) return "";
+  const parts = connectorId.split("/").filter(Boolean);
+  return parts[parts.length - 1] ?? "";
+}
+
+function buildClientData(definition: Json, connectionReferences: Record<string, ConnectionReferenceEntry>): ClientData {
+  return { properties: { connectionReferences, definition }, schemaVersion: "1.0.0.0" };
+}
+
+// ─── Walking the template ─────────────────────────────────────────────────────
+
+interface ActionVisit {
+  name: string;
+  action: Json;
+  /** Dotted location, e.g. `actions.Scope.actions.Get_row`. */
+  path: string;
+  /** Names of the actions that share this action's container — what runAfter may reference. */
+  siblings: Set<string>;
+  depth: number;
+}
+
+/** Every container of child actions an action can hold: If/Scope/Foreach/Until and Switch. */
+function childContainers(action: Json, path: string): Array<{ actions: Json; path: string }> {
+  const out: Array<{ actions: Json; path: string }> = [];
+  if (action.actions && typeof action.actions === "object") out.push({ actions: action.actions, path: `${path}.actions` });
+  if (action.else?.actions && typeof action.else.actions === "object") out.push({ actions: action.else.actions, path: `${path}.else.actions` });
+  if (action.default?.actions && typeof action.default.actions === "object") out.push({ actions: action.default.actions, path: `${path}.default.actions` });
+  for (const [caseName, c] of Object.entries((action.cases ?? {}) as Json)) {
+    if (c?.actions && typeof c.actions === "object") out.push({ actions: c.actions, path: `${path}.cases.${caseName}.actions` });
+  }
+  return out;
+}
+
+function walkActions(actions: Json | undefined, visit: (v: ActionVisit) => void, path = "actions", depth = 0): void {
+  if (!actions || typeof actions !== "object") return;
+  const siblings = new Set(Object.keys(actions));
+  for (const [name, action] of Object.entries(actions)) {
+    if (!action || typeof action !== "object") continue;
+    const here = `${path}.${name}`;
+    visit({ name, action, path: here, siblings, depth });
+    for (const child of childContainers(action, here)) walkActions(child.actions, visit, child.path, depth + 1);
+  }
+}
+
+const CONNECTOR_TYPES = new Set(["OpenApiConnection", "OpenApiConnectionWebhook", "OpenApiConnectionNotification", "ApiConnection", "ApiConnectionWebhook"]);
+
+function isConnectorOperation(node: Json): boolean {
+  return CONNECTOR_TYPES.has(node.type) && typeof node.inputs === "object" && node.inputs !== null;
+}
+
+/** Visit every string value under `node`, with its path. */
+function walkStrings(node: unknown, path: string, visit: (s: string, path: string) => void): void {
+  if (typeof node === "string") { visit(node, path); return; }
+  if (Array.isArray(node)) { node.forEach((v, i) => walkStrings(v, `${path}[${i}]`, visit)); return; }
+  if (node && typeof node === "object") {
+    for (const [k, v] of Object.entries(node)) walkStrings(v, `${path}.${k}`, visit);
+  }
+}
+
+/** True when a `@{` string-interpolation segment is never closed. `@@{` is an escaped literal. */
+function hasUnterminatedInterpolation(s: string): boolean {
+  let i = s.indexOf("@{");
+  while (i !== -1) {
+    const escaped = i > 0 && s[i - 1] === "@";
+    if (!escaped && s.indexOf("}", i + 2) === -1) return true;
+    i = s.indexOf("@{", i + 2);
+  }
+  return false;
+}
+
+// ─── Lint ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Static checks on a definition + its connectionReferences. Errors are things activation is
+ * known to reject (or that silently break the trigger); warnings are things worth a look.
+ * Deliberately conservative — a false "error" would block a valid flow.
+ */
+function lintFlow(definition: Json, connectionReferences: Record<string, ConnectionReferenceEntry>): LintIssue[] {
+  const issues: LintIssue[] = [];
+  const err = (code: string, message: string, path?: string) => issues.push({ severity: "error", code, message, path });
+  const warn = (code: string, message: string, path?: string) => issues.push({ severity: "warning", code, message, path });
+
+  const triggers = definition.triggers;
+  const triggerNames = triggers && typeof triggers === "object" ? Object.keys(triggers) : [];
+  if (triggerNames.length === 0) err("NO_TRIGGER", "The definition has no trigger. A cloud flow needs exactly one entry under `triggers`.", "triggers");
+  if (triggerNames.length > 1) err("MULTIPLE_TRIGGERS", `Cloud flows support exactly one trigger; found ${triggerNames.length}: ${triggerNames.join(", ")}.`, "triggers");
+  if (!definition.actions || Object.keys(definition.actions).length === 0) {
+    warn("NO_ACTIONS", "The definition has no actions. The flow will run its trigger and do nothing.", "actions");
+  }
+
+  const refKeys = new Set(Object.keys(connectionReferences ?? {}));
+  const usedKeys = new Set<string>();
+
+  const checkConnectorOp = (node: Json, path: string) => {
+    const host = node.inputs?.host ?? {};
+    const key = host.connectionName ?? host.connectionReferenceName;
+    if (!key) {
+      err("MISSING_CONNECTION_NAME", `Connector operation has no inputs.host.connectionName. Set it to a key of connectionReferences (${[...refKeys].join(", ") || "none declared"}).`, path);
+      return;
+    }
+    usedKeys.add(key);
+    if (!refKeys.has(key)) {
+      // Activation reports this misleadingly — as "should not have the property 'authentication'"
+      // or "host.connectionReferenceName is missing" — so name the real cause here.
+      err(
+        "UNDECLARED_CONNECTION",
+        `inputs.host.connectionName "${key}" is not a key of connectionReferences (` +
+        `${[...refKeys].join(", ") || "none declared"}). Pass connection_references: { "${key}": "<connection reference logical name>" } — ` +
+        "find one with list_connection_references.",
+        path,
+      );
+    }
+    if (!host.operationId) err("MISSING_OPERATION_ID", "Connector operation has no inputs.host.operationId.", path);
+    if (host.operationId === "SubscribeWebhookTrigger") lintDataverseTrigger(node, path, err, warn);
+  };
+
+  for (const name of triggerNames) {
+    const t = triggers[name];
+    if (t && isConnectorOperation(t)) checkConnectorOp(t, `triggers.${name}`);
+  }
+
+  walkActions(definition.actions, ({ name, action, path, siblings }) => {
+    for (const dep of Object.keys(action.runAfter ?? {})) {
+      if (!siblings.has(dep)) {
+        err("BAD_RUN_AFTER", `"${name}" runs after "${dep}", which is not an action in the same scope. runAfter may only name siblings.`, `${path}.runAfter`);
+      }
+    }
+    if (runsAfterItself(action, name)) err("BAD_RUN_AFTER", `"${name}" runs after itself.`, `${path}.runAfter`);
+    if (isConnectorOperation(action)) checkConnectorOp(action, path);
+    if (action.type === "Workflow" && !isGuid(action.inputs?.host?.workflowReferenceName)) {
+      warn("CHILD_FLOW_REFERENCE", `Child-flow action "${name}" should set inputs.host.workflowReferenceName to the child flow's workflowid (a GUID).`, path);
+    }
+  });
+
+  walkStrings({ triggers: definition.triggers, actions: definition.actions }, "", (s, path) => {
+    if (hasUnterminatedInterpolation(s)) {
+      err("UNTERMINATED_EXPRESSION", `String contains "@{" with no closing "}": ${s.length > 80 ? `${s.slice(0, 80)}…` : s}`, path.replace(/^\./, ""));
+    }
+  });
+
+  for (const [key, entry] of Object.entries(connectionReferences ?? {})) {
+    const logical = entry?.connection?.connectionReferenceLogicalName;
+    if (!logical) {
+      warn("NO_CONNECTION_REFERENCE_NAME", `connectionReferences.${key} has no connection.connectionReferenceLogicalName, so it is not bound through a connection reference. Solution-aware flows should use one.`, `connectionReferences.${key}`);
+    }
+    if (!usedKeys.has(key)) warn("UNUSED_CONNECTION_REFERENCE", `connectionReferences.${key} is declared but no trigger or action uses it.`, `connectionReferences.${key}`);
+  }
+
+  return issues;
+}
+
+function runsAfterItself(action: Json, name: string): boolean {
+  return Object.prototype.hasOwnProperty.call(action.runAfter ?? {}, name);
+}
+
+function lintDataverseTrigger(
+  trigger: Json,
+  path: string,
+  err: (code: string, message: string, path?: string) => void,
+  warn: (code: string, message: string, path?: string) => void,
+): void {
+  const p = trigger.inputs?.parameters ?? {};
+  const message = Number(p["subscriptionRequest/message"]);
+  const scope = p["subscriptionRequest/scope"];
+  if (!p["subscriptionRequest/entityname"]) err("DATAVERSE_TRIGGER_NO_TABLE", "Dataverse trigger has no subscriptionRequest/entityname (the table logical name).", path);
+  if (!DATAVERSE_TRIGGER_MESSAGES[message]) {
+    err("DATAVERSE_TRIGGER_BAD_MESSAGE", `subscriptionRequest/message must be 1-7 (${Object.entries(DATAVERSE_TRIGGER_MESSAGES).map(([k, v]) => `${k}=${v}`).join(", ")}).`, path);
+  }
+  if (scope !== undefined && !DATAVERSE_TRIGGER_SCOPES[Number(scope)]) {
+    err("DATAVERSE_TRIGGER_BAD_SCOPE", "subscriptionRequest/scope must be 1=User, 2=Business Unit, 3=Parent: Child Business Unit, or 4=Organization.", path);
+  }
+  if (scope === undefined) warn("DATAVERSE_TRIGGER_NO_SCOPE", "subscriptionRequest/scope is not set; the designer always writes it (4 = Organization fires for every row).", path);
+  if (p["subscriptionRequest/filteringattributes"] && DATAVERSE_TRIGGER_MESSAGES[message] && !MESSAGES_WITH_UPDATE.has(message)) {
+    // Verified against a live org: this saves AND activates fine, then the webhook registration fails with
+    // 0x80040203 "To use FilteringAttributes, your trigger must include an Update event" — the
+    // flow shows as On and never fires.
+    err(
+      "DATAVERSE_TRIGGER_FILTER_WITHOUT_UPDATE",
+      `filteringattributes is only valid when the change type includes Modified (message 3, 4, 6 or 7); this trigger is ${DATAVERSE_TRIGGER_MESSAGES[message]} (${message}). ` +
+      "It would turn On and silently never register.",
+      path,
+    );
+  }
+}
+
+// ─── Summaries ────────────────────────────────────────────────────────────────
+
+interface TriggerSummary {
+  name: string;
+  type: string;
+  kind?: string;
+  connector?: string;
+  operation?: string;
+  dataverse?: { table: string; change: string; scope?: string; filtering_attributes?: string; filter_expression?: string };
+  recurrence?: Json;
+}
+
+function summarizeTrigger(definition: Json): TriggerSummary | null {
+  const entries = Object.entries((definition?.triggers ?? {}) as Json);
+  if (entries.length === 0) return null;
+  const [name, t] = entries[0]!;
+  const host = t?.inputs?.host ?? {};
+  const summary: TriggerSummary = { name, type: t?.type };
+  if (t?.kind) summary.kind = t.kind;
+  if (host.apiId) summary.connector = apiNameFromConnectorId(host.apiId);
+  if (host.operationId) summary.operation = host.operationId;
+  if (host.operationId === "SubscribeWebhookTrigger") {
+    const p = t.inputs.parameters ?? {};
+    const message = Number(p["subscriptionRequest/message"]);
+    summary.dataverse = {
+      table: p["subscriptionRequest/entityname"],
+      change: DATAVERSE_TRIGGER_MESSAGES[message] ? `${DATAVERSE_TRIGGER_MESSAGES[message]} (${message})` : String(p["subscriptionRequest/message"]),
+      ...(p["subscriptionRequest/scope"] !== undefined ? { scope: DATAVERSE_TRIGGER_SCOPES[Number(p["subscriptionRequest/scope"])] ?? String(p["subscriptionRequest/scope"]) } : {}),
+      ...(p["subscriptionRequest/filteringattributes"] ? { filtering_attributes: p["subscriptionRequest/filteringattributes"] } : {}),
+      ...(p["subscriptionRequest/filterexpression"] ? { filter_expression: p["subscriptionRequest/filterexpression"] } : {}),
+    };
+  }
+  if (t?.recurrence) summary.recurrence = t.recurrence;
+  return summary;
+}
+
+/** True when this flow's trigger is a Dataverse row webhook, which registers a callbackregistration. */
+function hasDataverseWebhookTrigger(definition: Json): boolean {
+  return summarizeTrigger(definition)?.operation === "SubscribeWebhookTrigger";
+}
+
+interface ActionOutline {
+  total: number;
+  /** Top-level actions in order, with nested counts — enough to orient before reading the JSON. */
+  top_level: Array<{ name: string; type: string; operation?: string; nested?: number }>;
+  connectors_used: string[];
+  child_flows: string[];
+}
+
+function outlineActions(definition: Json): ActionOutline {
+  let total = 0;
+  const connectors = new Set<string>();
+  const childFlows = new Set<string>();
+  const nestedCount = new Map<string, number>();
+  walkActions(definition?.actions, ({ action, path, depth }) => {
+    total++;
+    if (depth > 0) {
+      const top = path.split(".")[1]!;
+      nestedCount.set(top, (nestedCount.get(top) ?? 0) + 1);
+    }
+    const apiId = action.inputs?.host?.apiId;
+    if (apiId) connectors.add(apiNameFromConnectorId(apiId));
+    if (action.type === "Workflow" && action.inputs?.host?.workflowReferenceName) childFlows.add(action.inputs.host.workflowReferenceName);
+  });
+  const top_level = Object.entries((definition?.actions ?? {}) as Json).map(([name, a]) => ({
+    name,
+    type: a?.type,
+    ...(a?.inputs?.host?.operationId ? { operation: a.inputs.host.operationId } : {}),
+    ...(nestedCount.get(name) ? { nested: nestedCount.get(name) } : {}),
+  }));
+  return { total, top_level, connectors_used: [...connectors].sort(), child_flows: [...childFlows] };
+}
+
+/** Connection reference logical names a clientdata depends on. */
+function connectionReferenceNames(connectionReferences: Record<string, ConnectionReferenceEntry>): string[] {
+  const out = new Set<string>();
+  for (const entry of Object.values(connectionReferences ?? {})) {
+    const n = entry?.connection?.connectionReferenceLogicalName;
+    if (n) out.add(n);
+  }
+  return [...out];
+}
+
+// ─── Error interpretation ─────────────────────────────────────────────────────
+
+/**
+ * Turn an activation/update failure into a cause and a fix. The Flow service's messages are
+ * accurate about *what* failed and often wrong about *why* — every mapping below is a message
+ * reproduced against a live org whose literal text sends you the wrong way.
+ */
+function explainFlowError(message: string): { cause: string; fix: string } | null {
+  const m = message;
+  if (/Cannot find connection with name/i.test(m) || /ConnectionNotFound/i.test(m)) {
+    return {
+      cause: "CONNECTION_NOT_ACCESSIBLE — a connection reference is bound to a connection that is not shared with you (or was deleted). The connection exists; you just cannot use it.",
+      fix: "Ask the connection's owner to share it with you, or rebind the connection reference to a connection you own (update_connection_reference), then turn the flow on again.",
+    };
+  }
+  if (/need connections created/i.test(m)) {
+    return {
+      cause: "UNBOUND_CONNECTION_REFERENCE — a connection reference the flow uses has no connection.",
+      fix: "Bind it (update_connection_reference with connection_id, or in the maker portal under Solutions → Connection references), then turn the flow on.",
+    };
+  }
+  if (/should not have the property 'authentication'/i.test(m) || /host\.connectionReferenceName' is missing/i.test(m)) {
+    return {
+      cause: "UNDECLARED_CONNECTION — an action's inputs.host.connectionName does not match any key in connectionReferences (the 'authentication' wording is a red herring).",
+      fix: "Make every connector action's host.connectionName equal a connectionReferences key. Run validate_cloud_flow to list them.",
+    };
+  }
+  if (/NullReferenceException/i.test(m)) {
+    return {
+      cause: "Usually a connector action uses @parameters('$authentication') while the definition does not declare the $authentication parameter, or a connectionReferences entry is malformed.",
+      fix: "Declare parameters.$authentication ({type: SecureObject, defaultValue: {}}) and $connections ({type: Object, defaultValue: {}}); create/update_cloud_flow add them automatically.",
+    };
+  }
+  if (/TemplateValidationError/i.test(m)) {
+    return { cause: "The Logic Apps template is invalid — the message names the action and the problem.", fix: "Fix the named action (runAfter target, expression syntax) and retry. validate_cloud_flow catches most of these without a write." };
+  }
+  if (/ConnectionReferenceNotFound|Failed to find connection references/i.test(m)) {
+    return { cause: "A connection reference logical name in the flow does not exist in this environment.", fix: "Create it (create_connection_reference) or use an existing one (list_connection_references)." };
+  }
+  if (/DLP|Data Loss Prevention|CompanyDLPViolation/i.test(m)) {
+    return { cause: "A data loss prevention policy forbids this combination of connectors in this environment.", fix: "Change the connectors or ask a Power Platform admin about the policy. Not fixable from Dataverse." };
+  }
+  if (/412|Precondition Failed/i.test(m)) {
+    return { cause: "The flow changed since you read it (someone saved it in the designer, or another call).", fix: "Re-read it with get_cloud_flow, re-apply your edit to the new definition, and pass the new version." };
+  }
+  return null;
+}
+
+/**
+ * Pull the human message out of a `D365 400: {json}` error. Flow-service failures arrive as
+ * JSON nested inside strings several layers deep, so the backslash runs are collapsed too.
+ */
+function dataverseErrorMessage(err: unknown): string {
+  const text = err instanceof Error ? err.message : String(err);
+  let message = text;
+  const brace = text.indexOf("{");
+  if (brace !== -1) {
+    try {
+      message = JSON.parse(text.slice(brace))?.error?.message ?? text;
+    } catch { /* not JSON — keep the raw text */ }
+  }
+  return message.replace(/\\+"/g, '"');
+}
+
+// ───────────────────────────── Power Automate (cloud flows) ───────────────────
+//
+// Cloud flows are Dataverse `workflow` rows (category 5); run history is the `flowrun`
+// elastic table; connectors bind through `connectionreference` rows. Everything here goes
+// through the Dataverse Web API only, with the same Dataverse token as every other tool.
+
+/** Poll cadence for a Dataverse trigger's webhook registration. Mutable so tests run instantly. */
+const flowTiming = { registrationPollMs: 3000, registrationAttempts: 6 };
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const FLOW_SELECT =
+  "workflowid,name,description,category,statecode,statuscode,modernflowtype,ismanaged," +
+  "createdon,modifiedon,_ownerid_value,_modifiedby_value,versionnumber";
+
+const CONNREF_SELECT =
+  "connectionreferenceid,connectionreferencelogicalname,connectionreferencedisplayname,connectorid," +
+  "connectionid,_ownerid_value,ismanaged,statecode,description,modifiedon";
+
+const STATE_LABELS: Record<number, string> = { 0: "Off", 1: "On", 2: "Suspended" };
+const FLOW_TYPE_FILTERS: Record<string, number> = { power_automate: 0, copilot_studio: 1, m365_agent: 2 };
+const RUN_STATUSES = new Set(["Succeeded", "Failed", "Cancelled"]);
+const MAX_RESTARTS_PER_CALL = 3;
+/** Connectors whose operations run over another connector's connection (AI Builder prompts run over the Dataverse connection). */
+const RIDES_ON: Record<string, string> = { aibuilder: DATAVERSE_API };
+
+const formatted = (row: Json, field: string): string | undefined =>
+  row[`${field}@OData.Community.Display.V1.FormattedValue`];
+
+function summarizeFlowRow(row: Json): Json {
+  return {
+    id: row.workflowid,
+    name: row.name,
+    state: STATE_LABELS[row.statecode] ?? String(row.statecode),
+    status: formatted(row, "statuscode") ?? row.statuscode,
+    type: MODERN_FLOW_TYPES[row.modernflowtype] ?? row.modernflowtype,
+    managed: row.ismanaged,
+    owner: formatted(row, "_ownerid_value") ?? row._ownerid_value,
+    owner_id: row._ownerid_value,
+    modified_on: row.modifiedon,
+    ...(row.description ? { description: row.description } : {}),
+  };
+}
+
+// ─── Lookups ──────────────────────────────────────────────────────────────────
+
+/** Power Platform environment id per org — needed for maker-portal links. Org metadata, not caller state. */
+const environmentIds = new Map<string, string | null>();
+
+async function environmentId(): Promise<string | null> {
+  const url = activeEnvironment!.url;
+  if (environmentIds.has(url)) return environmentIds.get(url)!;
+  let id: string | null = null;
+  try {
+    const org = (await d365("RetrieveCurrentOrganization(AccessType=Microsoft.Dynamics.CRM.EndpointAccessType'Default')")) as Json;
+    id = org?.Detail?.EnvironmentId ?? org?.EnvironmentId ?? null;
+  } catch {
+    id = null; // a missing link is not worth failing the tool over
+  }
+  environmentIds.set(url, id);
+  return id;
+}
+
+function flowPortalUrl(envId: string | null, flowId: string): string | undefined {
+  return envId ? `https://make.powerautomate.com/environments/${envId}/flows/${flowId}/details` : undefined;
+}
+
+async function getFlowRow(flowId: string, extraSelect = ""): Promise<Json> {
+  const id = assertGuid(flowId, "flow_id");
+  const row = (await d365(`workflows(${id})?$select=${FLOW_SELECT}${extraSelect ? `,${extraSelect}` : ""}`)) as Json;
+  if (row.category !== FLOW_CATEGORY) {
+    throw new Error(
+      `NOT_A_CLOUD_FLOW: workflow ${id} ("${row.name}") has category ${row.category}` +
+      `${formatted(row, "category") ? ` (${formatted(row, "category")})` : ""}, not 5 (Modern Flow). These tools manage Power Automate cloud flows only.`,
+    );
+  }
+  return row;
+}
+
+async function resolveFlowId(args: { flow_id?: string; name?: string }): Promise<string> {
+  if (args.flow_id) return assertGuid(args.flow_id, "flow_id");
+  if (!args.name) throw new Error("INVALID_ARGUMENT: pass flow_id (preferred) or the flow's exact name.");
+  const res = (await d365(
+    `workflows?$filter=category eq ${FLOW_CATEGORY} and name eq '${escapeODataString(args.name)}'&$select=workflowid,name,statecode,ismanaged`,
+  )) as Json;
+  const rows: Json[] = res.value ?? [];
+  if (rows.length === 0) throw new Error(`FLOW_NOT_FOUND: no cloud flow is named exactly "${args.name}". Use list_cloud_flows with name_contains.`);
+  if (rows.length > 1) {
+    throw new Error(
+      `AMBIGUOUS_FLOW_NAME: ${rows.length} cloud flows are named "${args.name}" — pass flow_id: ` +
+      rows.map((r) => `${r.workflowid} (${STATE_LABELS[r.statecode]}${r.ismanaged ? ", managed" : ""})`).join(", "),
+    );
+  }
+  return rows[0]!.workflowid;
+}
+
+async function callerId(): Promise<string | null> {
+  try {
+    return ((await d365("WhoAmI")) as Json).UserId ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchConnectionReferences(logicalNames: string[]): Promise<Map<string, Json>> {
+  const out = new Map<string, Json>();
+  if (logicalNames.length === 0) return out;
+  const filter = logicalNames.map((n) => `connectionreferencelogicalname eq '${escapeODataString(n)}'`).join(" or ");
+  const res = (await d365(`connectionreferences?$filter=${filter}&$select=${CONNREF_SELECT}`)) as Json;
+  for (const row of res.value ?? []) out.set(String(row.connectionreferencelogicalname).toLowerCase(), row);
+  return out;
+}
+
+async function resolveConnectionReference(ref: string): Promise<Json> {
+  if (isGuid(ref)) return (await d365(`connectionreferences(${assertGuid(ref, "connection_reference")})?$select=${CONNREF_SELECT}`)) as Json;
+  const rows = await fetchConnectionReferences([ref]);
+  const row = rows.get(ref.toLowerCase());
+  if (!row) throw new Error(`CONNECTION_REFERENCE_NOT_FOUND: no connection reference has logical name "${ref}". Use list_connection_references.`);
+  return row;
+}
+
+/** Active (or all) cloud flows whose clientdata binds this connection reference logical name. */
+async function flowsUsingConnectionReference(logicalName: string, activeOnly: boolean): Promise<Json[]> {
+  // The closing quote pins an exact match: clientdata holds `"connectionReferenceLogicalName":"<name>"`,
+  // so `<name>"` cannot also match a longer name that merely starts with this one.
+  const needle = escapeODataString(`${logicalName}"`);
+  const res = (await d365(
+    `workflows?$filter=category eq ${FLOW_CATEGORY}${activeOnly ? " and statecode eq 1" : ""} and contains(clientdata,'${needle}')` +
+    "&$select=workflowid,name,statecode,ismanaged",
+  )) as Json;
+  return (res.value ?? []).map((r: Json) => ({ id: r.workflowid, name: r.name, state: STATE_LABELS[r.statecode], managed: r.ismanaged }));
+}
+
+/**
+ * A Dataverse-triggered flow is only live once Dataverse holds a non-deleted
+ * callbackregistration named after its workflowid. Activation does not wait for it and does
+ * not fail when it cannot be made, so this is the check that "On" actually means "will fire".
+ */
+async function verifyTriggerRegistration(flowId: string, attempts = flowTiming.registrationAttempts): Promise<Json> {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    let rows: Json[];
+    try {
+      const res = (await d365(
+        `callbackregistrations?$filter=name eq '${flowId}' and softdeletestatus eq 0` +
+        "&$select=callbackregistrationid,entityname,message,scope,filteringattributes",
+      )) as Json;
+      rows = res.value ?? [];
+    } catch (err) {
+      return { registered: null, note: `Could not read callbackregistrations to confirm the trigger: ${dataverseErrorMessage(err)}` };
+    }
+    if (rows.length > 0) {
+      const r = rows[0]!;
+      return { registered: true, table: r.entityname, message: r.message, ...(r.filteringattributes ? { filtering_attributes: r.filteringattributes } : {}) };
+    }
+    if (attempt < attempts - 1) await sleep(flowTiming.registrationPollMs);
+  }
+  return {
+    registered: false,
+    warning:
+      "TRIGGER_NOT_REGISTERED: the flow is On but Dataverse holds no live webhook registration for its trigger, so it will not fire. " +
+      "Activation does not surface this. Usual causes: filteringattributes on a change type without Modified, a wrong table name, " +
+      "or the connection's user lacking privileges on the table. Open the flow's trigger history in the maker portal for the exact error.",
+  };
+}
+
+// ─── Definition preparation (shared by validate/create/update) ────────────────
+
+interface Prepared {
+  clientdata: ClientData;
+  issues: LintIssue[];
+  added: string[];
+}
+
+/**
+ * Build the final clientdata and check it against the environment: normalize the template,
+ * resolve connection reference logical names to real rows (filling api.name from the row's
+ * connector), then lint. Nothing is written.
+ */
+async function prepareClientData(input: {
+  definition?: unknown;
+  connection_references?: unknown;
+  base?: ClientData | null;
+}): Promise<Prepared> {
+  const issues: LintIssue[] = [];
+  let definition: Json;
+  let refs: Record<string, ConnectionReferenceEntry> = { ...(input.base?.properties.connectionReferences ?? {}) };
+
+  const defInput = coerceObject(input.definition, "definition");
+  if (defInput) {
+    const split = splitDefinitionInput(defInput);
+    definition = split.definition;
+    if (split.connectionReferences) refs = { ...refs, ...split.connectionReferences };
+  } else if (input.base) {
+    definition = input.base.properties.definition;
+  } else {
+    throw new Error("INVALID_ARGUMENT: definition is required.");
+  }
+  const { definition: normalized, added } = normalizeDefinition(definition);
+
+  // connection_references: { "<connectionName key>": "<logical name>" | <full entry> }
+  const refArg = coerceObject(input.connection_references, "connection_references") ?? {};
+  const byLogicalName: Array<{ key: string; logical: string }> = [];
+  for (const [key, value] of Object.entries(refArg)) {
+    if (typeof value === "string") byLogicalName.push({ key, logical: value });
+    else if (value && typeof value === "object") refs[key] = value as ConnectionReferenceEntry;
+    else throw new Error(`INVALID_ARGUMENT: connection_references.${key} must be a connection reference logical name or an entry object.`);
+  }
+
+  const wanted = new Set([...connectionReferenceNames(refs), ...byLogicalName.map((b) => b.logical)]);
+  const rows = await fetchConnectionReferences([...wanted]);
+  for (const { key, logical } of byLogicalName) {
+    const row = rows.get(logical.toLowerCase());
+    // Use the row's exact logical name casing; Dataverse matches it case-sensitively at create.
+    refs[key] = connectionReferenceEntry(row?.connectionreferencelogicalname ?? logical, apiNameFromConnectorId(row?.connectorid) || key.replace(/[-_]\d+$/, ""));
+  }
+
+  const me = await callerId();
+  for (const [key, entry] of Object.entries(refs)) {
+    const logical = entry?.connection?.connectionReferenceLogicalName;
+    if (!logical) continue;
+    const row = rows.get(logical.toLowerCase());
+    const path = `connectionReferences.${key}`;
+    if (!row) {
+      issues.push({ severity: "error", code: "CONNECTION_REFERENCE_NOT_FOUND", path, message: `Connection reference "${logical}" does not exist in ${activeEnvironment!.name}. Create it (create_connection_reference) or pick one from list_connection_references.` });
+      continue;
+    }
+    const api = apiNameFromConnectorId(row.connectorid);
+    if (entry.api?.name && api && entry.api.name !== api) {
+      issues.push({ severity: "error", code: "CONNECTOR_MISMATCH", path, message: `"${logical}" is a ${api} connection reference, but this entry declares api.name "${entry.api.name}".` });
+    }
+    if (!row.connectionid) {
+      issues.push(api === DATAVERSE_API
+        ? { severity: "warning", code: "UNBOUND_DATAVERSE_CONNECTION_REFERENCE", path, message: `"${logical}" has no connection. Dataverse actions still run (as the flow owner, through the implicit $authentication), but bind it before promoting.` }
+        : { severity: "warning", code: "UNBOUND_CONNECTION_REFERENCE", path, message: `"${logical}" (${api}) has no connection — turning the flow on will fail until it is bound (update_connection_reference, or the maker portal).` });
+    } else if (me && row._ownerid_value && row._ownerid_value !== me) {
+      issues.push({ severity: "warning", code: "CONNECTION_OWNED_BY_SOMEONE_ELSE", path, message: `"${logical}" belongs to ${formatted(row, "_ownerid_value") ?? row._ownerid_value}. Turning the flow on fails with "Cannot find connection" unless that connection is shared with you.` });
+    }
+  }
+
+  // Connector operations must target the same connector as the reference they name.
+  const apiForKey = new Map(Object.entries(refs).map(([k, e]) => [k, e?.api?.name]));
+  const checkApi = (node: Json, path: string) => {
+    const host = node?.inputs?.host;
+    if (!host?.apiId || !host.connectionName) return;
+    const declared = apiForKey.get(host.connectionName);
+    const used = apiNameFromConnectorId(host.apiId);
+    if (declared && used && declared !== used && RIDES_ON[used] !== declared) {
+      issues.push({ severity: "error", code: "CONNECTOR_MISMATCH", path, message: `Operation uses ${used} through connectionName "${host.connectionName}", which is a ${declared} reference.` });
+    }
+  };
+  for (const [name, t] of Object.entries((normalized.triggers ?? {}) as Json)) checkApi(t, `triggers.${name}`);
+  walkActions(normalized.actions, ({ action, path }) => checkApi(action, path));
+
+  issues.push(...(await checkDataverseTableNames(normalized)));
+  issues.push(...lintFlow(normalized, refs));
+  return { clientdata: buildClientData(normalized, refs), issues, added };
+}
+
+/**
+ * The Dataverse connector names tables two different ways: the row trigger takes the LOGICAL
+ * name (`incident`), every action takes the entity SET name (`incidents`). Activation checks
+ * neither — a wrong one fails at run time, or for a trigger never registers — so resolve every
+ * literal table name against this org's metadata in one query.
+ */
+async function checkDataverseTableNames(definition: Json): Promise<LintIssue[]> {
+  const wanted: Array<{ value: string; role: "trigger" | "action"; path: string }> = [];
+  const isLiteral = (v: unknown): v is string => typeof v === "string" && v !== "" && !v.startsWith("@");
+  const isDataverse = (node: Json) => apiNameFromConnectorId(node?.inputs?.host?.apiId) === DATAVERSE_API;
+
+  for (const [name, t] of Object.entries((definition.triggers ?? {}) as Json)) {
+    const table = t?.inputs?.parameters?.["subscriptionRequest/entityname"];
+    // "none" is how the action/business-event trigger says "unbound" — not a table.
+    if (isDataverse(t) && isLiteral(table) && table !== "none") wanted.push({ value: table, role: "trigger", path: `triggers.${name}` });
+  }
+  walkActions(definition.actions, ({ action, path }) => {
+    const table = action.inputs?.parameters?.entityName;
+    if (isDataverse(action) && isLiteral(table)) wanted.push({ value: table, role: "action", path });
+  });
+  if (wanted.length === 0) return [];
+
+  const distinct = [...new Set(wanted.map((w) => w.value))];
+  const filter = distinct
+    .map((v) => `LogicalName eq '${escapeODataString(v)}' or EntitySetName eq '${escapeODataString(v)}'`)
+    .join(" or ");
+  let rows: Json[];
+  try {
+    rows = (((await d365(`EntityDefinitions?$select=LogicalName,EntitySetName&$filter=${filter}`)) as Json).value ?? []);
+  } catch {
+    return []; // metadata unavailable — the other checks still stand
+  }
+  const byLogical = new Map(rows.map((r) => [String(r.LogicalName).toLowerCase(), r]));
+  const bySet = new Map(rows.map((r) => [String(r.EntitySetName).toLowerCase(), r]));
+
+  const issues: LintIssue[] = [];
+  for (const w of wanted) {
+    const key = w.value.toLowerCase();
+    if (w.role === "trigger") {
+      if (byLogical.has(key)) continue;
+      const asSet = bySet.get(key);
+      issues.push(asSet
+        ? { severity: "error", code: "DATAVERSE_TABLE_NAME", path: w.path, message: `The row trigger takes the table's logical name: use "${asSet.LogicalName}", not the entity set name "${w.value}".` }
+        : { severity: "error", code: "DATAVERSE_TABLE_NOT_FOUND", path: w.path, message: `No table with logical name "${w.value}" exists in ${activeEnvironment!.name}.` });
+    } else {
+      if (bySet.has(key)) continue;
+      const asLogical = byLogical.get(key);
+      issues.push(asLogical
+        ? { severity: "error", code: "DATAVERSE_TABLE_NAME", path: w.path, message: `Dataverse actions take the entity set name: use entityName "${asLogical.EntitySetName}", not the logical name "${w.value}".` }
+        : { severity: "error", code: "DATAVERSE_TABLE_NOT_FOUND", path: w.path, message: `No table with entity set name "${w.value}" exists in ${activeEnvironment!.name}.` });
+    }
+  }
+  return issues;
+}
+
+function errorsOf(issues: LintIssue[]): LintIssue[] {
+  return issues.filter((i) => i.severity === "error");
+}
+
+function validationFailure(issues: LintIssue[]): Error {
+  const errors = errorsOf(issues);
+  return new Error(
+    `VALIDATION_FAILED: ${errors.length} error(s), nothing was written.\n` +
+    errors.map((e) => `- [${e.code}] ${e.message}${e.path ? ` (at ${e.path})` : ""}`).join("\n"),
+  );
+}
+
+function issueLines(issues: LintIssue[], severity: LintIssue["severity"]): string[] {
+  return issues.filter((i) => i.severity === severity).map((i) => `[${i.code}] ${i.message}${i.path ? ` (at ${i.path})` : ""}`);
+}
+
+/** Turn a flow on. Returns the outcome rather than throwing, so callers can report a created-but-off flow. */
+async function activate(flowId: string): Promise<Json> {
+  try {
+    await d365(`workflows(${flowId})`, "PATCH", { statecode: 1, statuscode: 2 });
+    return { ok: true };
+  } catch (err) {
+    const message = dataverseErrorMessage(err);
+    return { ok: false, error: message, ...(explainFlowError(message) ?? {}) };
+  }
+}
+
+// ─── Tools ────────────────────────────────────────────────────────────────────
+
+async function handleListCloudFlows(args: {
+  name_contains?: string; state?: string; solution?: string; flow_type?: string;
+  trigger_table?: string; definition_contains?: string; include_managed?: boolean; top?: number;
+}): Promise<unknown> {
+  requireEnv();
+  const top = Math.min(Math.max(Number(args.top) || 100, 1), 500);
+  const filters = [`category eq ${FLOW_CATEGORY}`];
+  if (args.name_contains) filters.push(`contains(name,'${escapeODataString(args.name_contains)}')`);
+  if (args.state === "on") filters.push("statecode eq 1");
+  else if (args.state === "off") filters.push("statecode eq 0");
+  if (args.flow_type && args.flow_type !== "all") {
+    const t = FLOW_TYPE_FILTERS[args.flow_type];
+    if (t === undefined) throw new Error(`INVALID_ARGUMENT: flow_type must be one of ${Object.keys(FLOW_TYPE_FILTERS).join(", ")}, all.`);
+    filters.push(`modernflowtype eq ${t}`);
+  }
+  if (args.include_managed === false) filters.push("ismanaged eq false");
+  if (args.definition_contains) filters.push(`contains(clientdata,'${escapeODataString(args.definition_contains)}')`);
+  if (args.trigger_table) filters.push(`contains(clientdata,'${escapeODataString(args.trigger_table)}')`);
+
+  // Narrowing to a solution is a join Dataverse cannot express from workflow, so fetch the
+  // solution's flow ids first and intersect; the server-side `top` would otherwise cut too early.
+  let inSolution: Set<string> | null = null;
+  if (args.solution) {
+    const sol = (await d365(`solutions?$filter=uniquename eq '${escapeODataString(args.solution)}'&$select=solutionid`)) as Json;
+    const solutionId = sol.value?.[0]?.solutionid;
+    if (!solutionId) throw new Error(`SOLUTION_NOT_FOUND: no solution has unique name "${args.solution}". Use list_solutions.`);
+    const comps = (await d365(
+      `solutioncomponents?$filter=_solutionid_value eq ${solutionId} and componenttype eq 29&$select=objectid`,
+      "GET", undefined, { Prefer: "odata.maxpagesize=5000" },
+    )) as Json;
+    inSolution = new Set((comps.value ?? []).map((c: Json) => String(c.objectid).toLowerCase()));
+  }
+
+  const needsClientData = Boolean(args.trigger_table);
+  // One row past `top` is how the response knows whether it was truncated.
+  const serverTop = inSolution || needsClientData ? 5000 : top + 1;
+  const res = (await d365(
+    `workflows?$filter=${filters.join(" and ")}&$select=${FLOW_SELECT}${needsClientData ? ",clientdata" : ""}&$orderby=name asc&$top=${serverTop}`,
+    "GET", undefined, { Prefer: `odata.include-annotations=*,odata.maxpagesize=${serverTop}` },
+  )) as Json;
+
+  let rows: Json[] = res.value ?? [];
+  if (inSolution) rows = rows.filter((r) => inSolution!.has(String(r.workflowid).toLowerCase()));
+  const matched: Json[] = [];
+  for (const row of rows) {
+    const flow = summarizeFlowRow(row);
+    if (needsClientData) {
+      const trigger = summarizeTrigger(parseClientData(row.clientdata)?.properties.definition ?? {});
+      if (trigger?.dataverse?.table?.toLowerCase() !== args.trigger_table!.toLowerCase()) continue;
+      flow.trigger = trigger.dataverse;
+    }
+    matched.push(flow);
+    if (matched.length > top) break;
+  }
+  const out = matched.slice(0, top);
+  return {
+    environment: activeEnvironment!.name,
+    count: out.length,
+    ...(matched.length > top ? { truncated: `More than ${top} match; narrow the filters or raise top (max 500).` } : {}),
+    flows: out,
+  };
+}
+
+async function handleGetCloudFlow(args: { flow_id?: string; name?: string; include_definition?: boolean }): Promise<unknown> {
+  requireEnv();
+  const id = await resolveFlowId(args);
+  const row = await getFlowRow(id, "clientdata,resourceid");
+  const cd = parseClientData(row.clientdata);
+  const definition = cd?.properties.definition ?? {};
+  const refs = cd?.properties.connectionReferences ?? {};
+
+  const [refRows, solutions, recent, envId] = await Promise.all([
+    fetchConnectionReferences(connectionReferenceNames(refs)),
+    d365(`solutioncomponents?$filter=objectid eq ${id} and componenttype eq 29&$select=_solutionid_value&$expand=solutionid($select=uniquename,friendlyname,ismanaged)`)
+      .then((r) => ((r as Json).value ?? []).map((c: Json) => c.solutionid?.uniquename ?? c._solutionid_value))
+      .catch(() => undefined),
+    d365(`flowruns?$filter=_workflow_value eq ${id}&$select=name,status,starttime,errorcode&$orderby=starttime desc&$top=5`)
+      .then((r) => ((r as Json).value ?? []).map((x: Json) => ({ run_id: x.name, status: x.status, start: x.starttime, ...(x.errorcode ? { error_code: x.errorcode } : {}) })))
+      .catch(() => undefined),
+    environmentId(),
+  ]);
+
+  const connection_references = Object.entries(refs).map(([key, entry]) => {
+    const logical = entry?.connection?.connectionReferenceLogicalName;
+    const r = logical ? refRows.get(logical.toLowerCase()) : undefined;
+    return {
+      key,
+      logical_name: logical ?? null,
+      runtime_source: entry?.runtimeSource,
+      connector: r ? apiNameFromConnectorId(r.connectorid) : entry?.api?.name,
+      ...(logical ? { exists: Boolean(r) } : {}),
+      ...(r ? { bound: Boolean(r.connectionid), owner: formatted(r, "_ownerid_value") ?? r._ownerid_value } : {}),
+    };
+  });
+
+  const result: Json = {
+    ...summarizeFlowRow(row),
+    environment: activeEnvironment!.name,
+    version: row.versionnumber,
+    created_on: row.createdon,
+    modified_by: formatted(row, "_modifiedby_value") ?? row._modifiedby_value,
+    portal_url: flowPortalUrl(envId, id),
+    solutions,
+    trigger: summarizeTrigger(definition),
+    actions: outlineActions(definition),
+    connection_references,
+    recent_runs: recent,
+  };
+  // One look, no polling: on a read the flow has long since settled.
+  if (row.statecode === 1 && hasDataverseWebhookTrigger(definition)) result.trigger_registration = await verifyTriggerRegistration(id, 1);
+  if (args.include_definition !== false) {
+    result.definition = definition;
+    result.connection_references_raw = refs;
+  }
+  return result;
+}
+
+async function handleValidateCloudFlow(args: { definition: unknown; connection_references?: unknown }): Promise<unknown> {
+  requireEnv();
+  const prepared = await prepareClientData(args);
+  return {
+    valid: errorsOf(prepared.issues).length === 0,
+    errors: issueLines(prepared.issues, "error"),
+    warnings: issueLines(prepared.issues, "warning"),
+    ...(prepared.added.length ? { added_boilerplate: prepared.added } : {}),
+    trigger: summarizeTrigger(prepared.clientdata.properties.definition),
+    note:
+      "Static checks only. The Flow service does its own full template validation when a flow is turned on; " +
+      "a Draft flow stores whatever it is given without validating it.",
+  };
+}
+
+async function handleCreateCloudFlow(args: {
+  name: string; definition: unknown; connection_references?: unknown; description?: string;
+  solution?: string; activate?: boolean;
+}): Promise<unknown> {
+  requireEnv();
+  if (!args.name?.trim()) throw new Error("INVALID_ARGUMENT: name is required.");
+  const prepared = await prepareClientData(args);
+  if (errorsOf(prepared.issues).length) throw validationFailure(prepared.issues);
+
+  const body: Json = {
+    category: FLOW_CATEGORY,
+    type: 1, // Definition
+    primaryentity: "none",
+    name: args.name.trim(),
+    clientdata: JSON.stringify(prepared.clientdata),
+  };
+  if (args.description) body.description = args.description;
+  const headers = args.solution ? { "MSCRM.SolutionUniqueName": args.solution } : undefined;
+  const created = (await d365("workflows", "POST", body, headers)) as Json;
+  const id: string = created.id;
+
+  const warnings = issueLines(prepared.issues, "warning");
+  if (!args.solution) {
+    warnings.push("Created outside any solution (it lands in the Default solution), so it will not travel with ALM. Pass solution to create it inside one.");
+  }
+
+  const result: Json = {
+    id,
+    name: body.name,
+    environment: activeEnvironment!.name,
+    solution: args.solution ?? null,
+    state: "Off",
+    portal_url: flowPortalUrl(await environmentId(), id),
+  };
+
+  if (args.activate) {
+    // Activation would fail on it anyway; skipping says why without a misleading Flow-service error.
+    const unboundNonDataverse = prepared.issues.find((i) => i.code === "UNBOUND_CONNECTION_REFERENCE");
+    if (unboundNonDataverse) {
+      result.activation = { ok: false, skipped: true, cause: unboundNonDataverse.message, fix: "Bind the connection reference, then call set_cloud_flow_state with state on." };
+    } else {
+      result.activation = await activate(id);
+      if (result.activation.ok) {
+        result.state = "On";
+        if (hasDataverseWebhookTrigger(prepared.clientdata.properties.definition)) {
+          result.trigger_registration = await verifyTriggerRegistration(id);
+        }
+      } else {
+        result.activation.note = "The flow was created and saved, but it is Off. Fix the cause, then update_cloud_flow and/or set_cloud_flow_state on.";
+      }
+    }
+  } else {
+    warnings.push("The flow is Off. Draft flows are stored without template validation — set_cloud_flow_state on is the real validation.");
+  }
+  if (prepared.added.length) result.added_boilerplate = prepared.added;
+  if (warnings.length) result.warnings = warnings;
+  return result;
+}
+
+async function handleUpdateCloudFlow(args: {
+  flow_id: string; name?: string; description?: string; definition?: unknown;
+  connection_references?: unknown; expected_version?: string | number; allow_managed?: boolean;
+}): Promise<unknown> {
+  requireEnv();
+  const id = assertGuid(args.flow_id, "flow_id");
+  const row = await getFlowRow(id, "clientdata");
+  if (row.ismanaged && !args.allow_managed) {
+    throw new Error(
+      `MANAGED_FLOW: "${row.name}" is managed. Editing it here creates an unmanaged layer on top of the managed solution, ` +
+      "which then masks every future upgrade of that flow. Change it in the source (unmanaged) environment and redeploy the solution. " +
+      "Pass allow_managed: true only if you deliberately want that layer.",
+    );
+  }
+
+  const body: Json = {};
+  const updated: string[] = [];
+  if (args.name !== undefined) { body.name = args.name; updated.push("name"); }
+  if (args.description !== undefined) { body.description = args.description; updated.push("description"); }
+
+  let prepared: Prepared | null = null;
+  if (args.definition !== undefined || args.connection_references !== undefined) {
+    prepared = await prepareClientData({ definition: args.definition, connection_references: args.connection_references, base: parseClientData(row.clientdata) });
+    if (errorsOf(prepared.issues).length) throw validationFailure(prepared.issues);
+    body.clientdata = JSON.stringify(prepared.clientdata);
+    updated.push(args.definition !== undefined ? "definition" : "connection_references");
+  }
+  if (updated.length === 0) throw new Error("INVALID_ARGUMENT: nothing to update — pass name, description, definition and/or connection_references.");
+
+  const wasOn = row.statecode === 1;
+  const headers = args.expected_version !== undefined ? { "If-Match": `W/"${String(args.expected_version).replace(/^W\/|"/g, "")}"` } : undefined;
+  try {
+    await d365(`workflows(${id})`, "PATCH", body, headers);
+  } catch (err) {
+    const message = dataverseErrorMessage(err);
+    const status = /^D365 (\d+)/.exec(err instanceof Error ? err.message : "")?.[1];
+    const hint = explainFlowError(status === "412" ? "412" : message);
+    throw new Error(
+      `UPDATE_FAILED: ${message}` +
+      (hint ? `\nCause: ${hint.cause}\nFix: ${hint.fix}` : "") +
+      (wasOn && body.clientdata ? "\nThe flow is still On and still running its previous definition — Dataverse rejected the change as a whole." : ""),
+    );
+  }
+
+  const result: Json = { id, name: body.name ?? row.name, updated, state: STATE_LABELS[row.statecode] };
+  const warnings = prepared ? issueLines(prepared.issues, "warning") : [];
+  if (prepared && wasOn) {
+    result.note = "The flow was On, so the Flow service validated and deployed the new definition immediately.";
+    if (hasDataverseWebhookTrigger(prepared.clientdata.properties.definition)) result.trigger_registration = await verifyTriggerRegistration(id);
+  } else if (prepared) {
+    warnings.push("The flow is Off, so the new definition was stored without validation. set_cloud_flow_state on validates and deploys it.");
+  }
+  if (row.ismanaged) warnings.push("This flow is managed: the change now sits in an unmanaged layer above the managed solution.");
+  if (prepared?.added.length) result.added_boilerplate = prepared.added;
+  if (warnings.length) result.warnings = warnings;
+  return result;
+}
+
+async function handleSetCloudFlowState(args: { flow_id: string; state: string }): Promise<unknown> {
+  requireEnv();
+  const id = assertGuid(args.flow_id, "flow_id");
+  if (!["on", "off", "restart"].includes(args.state)) throw new Error("INVALID_ARGUMENT: state must be on, off or restart.");
+  const row = await getFlowRow(id, "clientdata");
+  const definition = parseClientData(row.clientdata)?.properties.definition ?? {};
+  const before = STATE_LABELS[row.statecode];
+
+  if (args.state === "off" || args.state === "restart") {
+    if (row.statecode !== 0) await d365(`workflows(${id})`, "PATCH", { statecode: 0, statuscode: 1 });
+    if (args.state === "off") return { id, name: row.name, state: "Off", previous_state: before };
+  }
+
+  const activation = await activate(id);
+  if (!activation.ok) {
+    return { id, name: row.name, state: "Off", previous_state: before, activation, note: "The flow is Off. Nothing about its definition was changed." };
+  }
+  const result: Json = { id, name: row.name, state: "On", previous_state: before };
+  if (hasDataverseWebhookTrigger(definition)) result.trigger_registration = await verifyTriggerRegistration(id);
+  return result;
+}
+
+async function handleDeleteCloudFlow(args: { flow_id: string; force?: boolean }): Promise<unknown> {
+  requireEnv();
+  const id = assertGuid(args.flow_id, "flow_id");
+  const row = await getFlowRow(id);
+  if (row.ismanaged) {
+    throw new Error(`MANAGED_FLOW: "${row.name}" is managed and cannot be deleted on its own — remove it from the source solution and upgrade, or uninstall the solution.`);
+  }
+  // A child flow is called by workflowid from its parents; deleting it breaks them at their next run.
+  const callers = (await d365(
+    `workflows?$filter=category eq ${FLOW_CATEGORY} and workflowid ne ${id} and contains(clientdata,'${id}')&$select=workflowid,name,statecode`,
+  )) as Json;
+  const parents = (callers.value ?? []).map((r: Json) => ({ id: r.workflowid, name: r.name, state: STATE_LABELS[r.statecode] }));
+  if (parents.length && !args.force) {
+    throw new Error(
+      `FLOW_IN_USE: ${parents.length} other flow(s) reference this flow's id (typically as a child flow): ` +
+      parents.map((p: Json) => `"${p.name}" (${p.id}, ${p.state})`).join(", ") +
+      ". Deleting it breaks them at their next run. Pass force: true to delete anyway.",
+    );
+  }
+  await d365(`workflows(${id})`, "DELETE");
+  return {
+    deleted: true,
+    id,
+    name: row.name,
+    was: STATE_LABELS[row.statecode],
+    ...(parents.length ? { broken_callers: parents } : {}),
+    note: "Removed from Dataverse and from the Flow service. This cannot be undone; a solution export is the only backup.",
+  };
+}
+
+async function handleListCloudFlowRuns(args: { flow_id?: string; status?: string; since?: string; top?: number }): Promise<unknown> {
+  requireEnv();
+  const top = Math.min(Math.max(Number(args.top) || 50, 1), 500);
+  const filters: string[] = [];
+  let flowId: string | undefined;
+  if (args.flow_id) { flowId = assertGuid(args.flow_id, "flow_id"); filters.push(`_workflow_value eq ${flowId}`); }
+  if (args.status) {
+    if (!RUN_STATUSES.has(args.status)) throw new Error(`INVALID_ARGUMENT: status must be one of ${[...RUN_STATUSES].join(", ")}.`);
+    filters.push(`status eq '${args.status}'`);
+  }
+  if (args.since) {
+    const since = new Date(args.since);
+    if (Number.isNaN(since.getTime())) throw new Error(`INVALID_ARGUMENT: since must be an ISO date/time, got "${args.since}".`);
+    filters.push(`starttime ge ${since.toISOString()}`);
+  }
+  const fq = filters.length ? `$filter=${filters.join(" and ")}&` : "";
+  const res = (await d365(
+    `flowruns?${fq}$select=name,status,starttime,endtime,triggertype,duration,errorcode,errormessage,_workflow_value&$orderby=starttime desc&$top=${top}`,
+  )) as Json;
+  const envId = await environmentId();
+
+  const runs = (res.value ?? []).map((r: Json) => {
+    let error: unknown = undefined;
+    if (r.errorcode || r.errormessage) {
+      let msg: unknown = r.errormessage;
+      try { msg = r.errormessage ? JSON.parse(r.errormessage) : undefined; } catch { /* keep the raw text */ }
+      error = { code: r.errorcode, message: msg };
+    }
+    const wf: string | undefined = r._workflow_value;
+    return {
+      run_id: r.name,
+      ...(flowId ? {} : { flow: formatted(r, "_workflow_value") ?? wf, flow_id: wf }),
+      status: r.status,
+      trigger: r.triggertype,
+      start: r.starttime,
+      end: r.endtime,
+      duration_ms: r.duration,
+      ...(error ? { error } : {}),
+      ...(envId && wf ? { portal_url: `https://make.powerautomate.com/environments/${envId}/flows/${wf}/runs/${r.name}` } : {}),
+    };
+  });
+
+  let counts: Json | undefined;
+  if (flowId) {
+    try {
+      const agg = (await d365(`flowruns?$apply=filter(${filters.join(" and ")})/groupby((status),aggregate($count as n))`)) as Json;
+      counts = Object.fromEntries((agg.value ?? []).map((g: Json) => [g.status, g.n]));
+    } catch { /* counts are a convenience */ }
+  }
+  return {
+    environment: activeEnvironment!.name,
+    count: runs.length,
+    ...(counts ? { counts_for_filter: counts } : {}),
+    runs,
+    note: "Run history reaches Dataverse about 5 minutes after a run finishes, is kept 28 days, and does not include in-progress runs.",
+  };
+}
+
+async function handleCancelCloudFlowRuns(args: { flow_id: string }): Promise<unknown> {
+  requireEnv();
+  const id = assertGuid(args.flow_id, "flow_id");
+  const row = await getFlowRow(id);
+  await d365(`workflows(${id})/Microsoft.Dynamics.CRM.CancelAllCloudFlowRuns`, "POST", {});
+  return {
+    id,
+    name: row.name,
+    cancelled: "all in-progress runs",
+    state: STATE_LABELS[row.statecode],
+    note: row.statecode === 1 ? "The flow is still On — new triggers start new runs. Turn it off first to stop it firing." : undefined,
+  };
+}
+
+async function handleListConnectionReferences(args: {
+  connector?: string; name_contains?: string; unbound_only?: boolean; include_flows?: boolean; top?: number;
+}): Promise<unknown> {
+  requireEnv();
+  const top = Math.min(Math.max(Number(args.top) || 100, 1), 500);
+  const filters: string[] = [];
+  if (args.connector) filters.push(`contains(connectorid,'${escapeODataString(args.connector)}')`);
+  if (args.name_contains) {
+    const n = escapeODataString(args.name_contains);
+    filters.push(`(contains(connectionreferencelogicalname,'${n}') or contains(connectionreferencedisplayname,'${n}'))`);
+  }
+  if (args.unbound_only) filters.push("connectionid eq null");
+  const fq = filters.length ? `$filter=${filters.join(" and ")}&` : "";
+  const res = (await d365(`connectionreferences?${fq}$select=${CONNREF_SELECT}&$orderby=connectionreferencelogicalname asc&$top=${top}`)) as Json;
+  const rows: Json[] = res.value ?? [];
+  if (args.include_flows && rows.length > 25) {
+    throw new Error(`INVALID_ARGUMENT: include_flows looks up each reference separately; narrow to 25 or fewer (matched ${rows.length}).`);
+  }
+  const me = await callerId();
+  const refs = await Promise.all(rows.map(async (r) => ({
+    id: r.connectionreferenceid,
+    logical_name: r.connectionreferencelogicalname,
+    display_name: r.connectionreferencedisplayname,
+    connector: apiNameFromConnectorId(r.connectorid),
+    bound: Boolean(r.connectionid),
+    connection_id: r.connectionid ?? null,
+    owner: formatted(r, "_ownerid_value") ?? r._ownerid_value,
+    ...(me ? { owned_by_you: r._ownerid_value === me } : {}),
+    managed: r.ismanaged,
+    ...(args.include_flows ? { used_by: await flowsUsingConnectionReference(r.connectionreferencelogicalname, false) } : {}),
+  })));
+  return { environment: activeEnvironment!.name, count: refs.length, connection_references: refs };
+}
+
+function normalizeConnectorId(connector: string): string {
+  const c = connector.trim();
+  if (c.startsWith("/providers/")) return c;
+  return `/providers/Microsoft.PowerApps/apis/${c.startsWith("shared_") ? c : `shared_${c}`}`;
+}
+
+async function handleCreateConnectionReference(args: {
+  logical_name: string; connector: string; display_name?: string; connection_id?: string;
+  description?: string; solution?: string;
+}): Promise<unknown> {
+  requireEnv();
+  if (!/^[A-Za-z0-9]+_[A-Za-z0-9_]+$/.test(args.logical_name ?? "")) {
+    throw new Error("INVALID_ARGUMENT: logical_name must start with a publisher prefix and contain only letters, digits and underscores, e.g. new_sharedcommondataserviceforapps_tickets.");
+  }
+  if (!args.connector) throw new Error("INVALID_ARGUMENT: connector is required, e.g. shared_commondataserviceforapps.");
+  const body: Json = {
+    connectionreferencelogicalname: args.logical_name,
+    connectionreferencedisplayname: args.display_name ?? args.logical_name,
+    connectorid: normalizeConnectorId(args.connector),
+  };
+  if (args.connection_id) body.connectionid = args.connection_id;
+  if (args.description) body.description = args.description;
+  const headers = args.solution ? { "MSCRM.SolutionUniqueName": args.solution } : undefined;
+  const created = (await d365("connectionreferences", "POST", body, headers)) as Json;
+  return {
+    id: created.id,
+    logical_name: args.logical_name,
+    connector: apiNameFromConnectorId(body.connectorid),
+    bound: Boolean(args.connection_id),
+    solution: args.solution ?? null,
+    next: args.connection_id
+      ? `Use it from a flow with connection_references: { "${apiNameFromConnectorId(body.connectorid)}": "${args.logical_name}" }.`
+      : "It has no connection yet. Bind one with update_connection_reference (connection_id) or in the maker portal — flows using it cannot be turned on until then (Dataverse-connector references excepted).",
+  };
+}
+
+async function handleUpdateConnectionReference(args: {
+  connection_reference: string; connection_id?: string; display_name?: string; description?: string; restart_flows?: boolean;
+}): Promise<unknown> {
+  requireEnv();
+  const ref = await resolveConnectionReference(args.connection_reference);
+  const body: Json = {};
+  if (args.connection_id !== undefined) body.connectionid = args.connection_id;
+  if (args.display_name !== undefined) body.connectionreferencedisplayname = args.display_name;
+  if (args.description !== undefined) body.description = args.description;
+  if (Object.keys(body).length === 0 && !args.restart_flows) {
+    throw new Error("INVALID_ARGUMENT: nothing to update — pass connection_id, display_name, description and/or restart_flows.");
+  }
+  if (Object.keys(body).length) await d365(`connectionreferences(${ref.connectionreferenceid})`, "PATCH", body);
+
+  const result: Json = { id: ref.connectionreferenceid, logical_name: ref.connectionreferencelogicalname, updated: Object.keys(body) };
+  // restart_flows alone is the follow-up to an earlier rebind, so it must not depend on this call changing the binding.
+  const rebound = args.connection_id !== undefined && args.connection_id !== ref.connectionid;
+  if (!rebound && !args.restart_flows) return result;
+
+  // Verified against a live org: an active flow keeps the connection it was activated with. Rebinding the
+  // reference changes nothing for it until it is turned off and on again.
+  const active = await flowsUsingConnectionReference(ref.connectionreferencelogicalname, true);
+  if (active.length === 0) return { ...result, active_flows: [] };
+  if (!args.restart_flows) {
+    return {
+      ...result,
+      active_flows: active,
+      warning: `${active.length} active flow(s) still run with the previous connection until restarted. Call set_cloud_flow_state with state restart on each, or repeat this call with restart_flows: true.`,
+    };
+  }
+  if (active.length > MAX_RESTARTS_PER_CALL) {
+    return {
+      ...result,
+      active_flows: active,
+      warning: `${active.length} active flows use this reference — more than the ${MAX_RESTARTS_PER_CALL} this call restarts at once. None were restarted; call set_cloud_flow_state with state restart on each.`,
+    };
+  }
+  const restarted: Json[] = [];
+  for (const f of active) {
+    const outcome = (await handleSetCloudFlowState({ flow_id: f.id, state: "restart" })) as Json;
+    restarted.push({ id: f.id, name: f.name, state: outcome.state, ...(outcome.activation ? { activation: outcome.activation } : {}), ...(outcome.trigger_registration ? { trigger_registration: outcome.trigger_registration } : {}) });
+  }
+  return { ...result, restarted };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // SERVER
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const server = new Server(
-  { name: "dynamics365-mcp", version: "6.0.0" },
+  { name: "dynamics365-mcp", version: "6.1.0" },
   { capabilities: { tools: {}, resources: {} } }
 );
 
@@ -2984,6 +4502,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "compute_federated_credential_subject": result = handleComputeFederatedCredentialSubject(args as any); break;
       // Batch
       case "execute_batch": result = await handleExecuteBatch(args as any); break;
+      // Power Automate (cloud flows)
+      case "list_cloud_flows": result = await handleListCloudFlows(args as any); break;
+      case "get_cloud_flow": result = await handleGetCloudFlow(args as any); break;
+      case "validate_cloud_flow": result = await handleValidateCloudFlow(args as any); break;
+      case "create_cloud_flow": result = await handleCreateCloudFlow(args as any); break;
+      case "update_cloud_flow": result = await handleUpdateCloudFlow(args as any); break;
+      case "set_cloud_flow_state": result = await handleSetCloudFlowState(args as any); break;
+      case "delete_cloud_flow": result = await handleDeleteCloudFlow(args as any); break;
+      case "list_cloud_flow_runs": result = await handleListCloudFlowRuns(args as any); break;
+      case "cancel_cloud_flow_runs": result = await handleCancelCloudFlowRuns(args as any); break;
+      case "list_connection_references": result = await handleListConnectionReferences(args as any); break;
+      case "create_connection_reference": result = await handleCreateConnectionReference(args as any); break;
+      case "update_connection_reference": result = await handleUpdateConnectionReference(args as any); break;
 
       default: throw new Error(`Unknown tool: ${name}`);
     }

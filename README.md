@@ -2,7 +2,7 @@
 
 MCP server that gives Claude (or any MCP client) full access to Microsoft Dynamics 365 / Dataverse APIs.
 
-68 tools + 18 skills covering metadata exploration, CRUD operations, plugin registration, solution ALM, security auditing, web resources, audit logs, managed identity, and more.
+99 tools + 20 skills covering metadata exploration, CRUD operations, plugin registration, solution ALM, security auditing, web resources, audit logs, managed identity, Power Automate cloud flows, and more.
 
 ---
 
@@ -25,7 +25,33 @@ MCP server that gives Claude (or any MCP client) full access to Microsoft Dynami
 | Managed Identity | 4 | UAMI setup for plugin Azure access |
 | Org Settings | 2 | Organization metadata, trace log control |
 | Batch | 1 | Execute multiple API calls atomically |
+| Power Automate | 12 | Cloud flow CRUD, validate, on/off/restart, run history, cancel runs, connection references |
 | PAC CLI | 4 skills | Auth, PCF component scaffolding, Plugin project scaffolding, Solution pack/unpack for CI/CD |
+
+### Power Automate (cloud flows)
+
+Cloud flows are Dataverse `workflow` rows (category 5) whose definition lives in `clientdata`; run
+history is the `flowrun` table; connectors bind through `connectionreference` rows. The 12 tools use
+the Dataverse Web API only — same token, no extra consent.
+
+| Tool | Does |
+|------|------|
+| `list_cloud_flows` | Filter by name, On/Off, solution, flow type, the table that triggers them, or text in their definition |
+| `get_cloud_flow` | Trigger summary, action outline, connection-reference health, solutions, latest runs, portal link, `version`, full definition, trigger registration |
+| `validate_cloud_flow` | Dry-run lint against the environment (no write) |
+| `create_cloud_flow` / `update_cloud_flow` | Validated create (in a solution) / replace; `expected_version` concurrency; managed flows refused by default |
+| `set_cloud_flow_state` | On / off / restart, with the real cause of activation failures |
+| `delete_cloud_flow` | Refuses managed flows and flows other flows call as a child, unless forced |
+| `list_cloud_flow_runs` / `cancel_cloud_flow_runs` | Run history with errors and per-status counts; cancel in-progress runs |
+| `list_connection_references` / `create_connection_reference` / `update_connection_reference` | Find, create, rebind (lists or restarts the active flows that keep the old connection) |
+
+Behaviour the tools guard against, each reproduced against a live org:
+
+- **Draft flows are not validated** — the Logic Apps template is checked only when a flow is turned on. The tools lint first and write nothing on error.
+- **"On" is not "will fire"** — a Dataverse trigger with `filteringattributes` on a change type without *Modified* activates and never registers. The tools confirm the trigger's `callbackregistration` after every activation.
+- **"Cannot find connection with name …"** means the connection is not shared with you, not that it is missing.
+- **Table names differ** — the row trigger takes the logical name (`incident`), actions take the entity set name (`incidents`); both are resolved against org metadata.
+- **Rebinding a connection reference does not reach active flows** until they are turned off and on.
 
 ---
 
@@ -190,6 +216,8 @@ Skills are `SKILL.md` files that give Claude domain-specific guidance. See [Quic
 | `pac-pcf` | PCF component scaffolding |
 | `pac-plugin` | Plugin project scaffolding |
 | `pac-solutions` | Solution pack/unpack for CI/CD |
+| `bulk-delete` | Create, monitor and cancel bulk deletion jobs |
+| `manage-power-automate` | Power Automate cloud flows — inspect, debug runs, author/edit/on-off/delete safely, connection references |
 
 ---
 
